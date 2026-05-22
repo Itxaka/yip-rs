@@ -164,6 +164,7 @@ impl Config {
 mod tests {
     use super::*;
     use indoc::indoc;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn parses_multi_stage_config() {
@@ -213,5 +214,83 @@ mod tests {
         let s = c.to_string_yaml().unwrap();
         let back = Config::load(s.as_bytes()).unwrap();
         assert_eq!(back, c);
+    }
+
+    #[test]
+    fn name_only_minimal_yaml() {
+        // Only `name` set; stages map left empty.
+        let cfg = Config::load(b"name: minimal\n").unwrap();
+        assert_eq!(cfg.name, "minimal");
+        assert!(cfg.stages.is_empty());
+        // `source` is not in YAML — remains empty.
+        assert!(cfg.source.is_empty());
+    }
+
+    #[test]
+    fn source_field_is_skipped_in_yaml() {
+        // `source` has #[serde(skip)] — must not appear in serialised YAML
+        // and must not be settable from YAML.
+        let cfg = Config {
+            source: "/etc/yip/whatever.yaml".into(),
+            name: "n".into(),
+            stages: HashMap::new(),
+        };
+        let s = cfg.to_string_yaml().unwrap();
+        assert!(!s.contains("source"));
+        // Round-trip: deserialised source must be empty (not preserved).
+        let back = Config::load(s.as_bytes()).unwrap();
+        assert!(back.source.is_empty());
+        assert_eq!(back.name, "n");
+    }
+
+    #[test]
+    fn to_string_yaml_skips_empty_name_and_stages() {
+        let cfg = Config::default();
+        let s = cfg.to_string_yaml().unwrap();
+        assert!(!s.contains("name:"));
+        assert!(!s.contains("stages:"));
+    }
+
+    #[test]
+    fn maximal_yaml_round_trip() {
+        // Every field populated. Multiple stages, multiple entries per stage.
+        let mut stages = HashMap::new();
+        stages.insert(
+            "rootfs".to_string(),
+            vec![
+                Stage {
+                    name: "first".into(),
+                    commands: vec!["echo a".into()],
+                    ..Default::default()
+                },
+                Stage {
+                    name: "second".into(),
+                    commands: vec!["echo b".into(), "echo c".into()],
+                    ..Default::default()
+                },
+            ],
+        );
+        stages.insert(
+            "initramfs".to_string(),
+            vec![Stage {
+                name: "ini".into(),
+                ..Default::default()
+            }],
+        );
+        let c = Config {
+            source: String::new(),
+            name: "max".into(),
+            stages,
+        };
+        let s = c.to_string_yaml().unwrap();
+        let back = Config::load(s.as_bytes()).unwrap();
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn load_rejects_invalid_yaml() {
+        // A scalar where a mapping is expected — Config requires a mapping.
+        let r = Config::load(b"- just a list\n- of strings\n");
+        assert!(r.is_err());
     }
 }

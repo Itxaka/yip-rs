@@ -1345,4 +1345,567 @@ mod tests {
             "URL-resolved key should land verbatim, got: {ak}"
         );
     }
+
+    // -----------------------------------------------------------------
+    // Ports of Go It-blocks from yip/pkg/plugins/user_test.go.
+    //
+    // The Go suite seeds `/etc/passwd` with the `existing_passwd` blob
+    // below (a representative set of system users with max UID = 999),
+    // leaves `/etc/shadow` / `/etc/group` empty, and asserts post-run
+    // file contents.
+    //
+    // One adaptation: the Go plugin resolves provider tokens like
+    // `github:mudler` into ssh-rsa key material. The Rust plugin
+    // writes ssh_authorized_keys entries verbatim (see
+    // `ssh_keys_from_url_provider_via_mockito` test above). We
+    // therefore pass already-resolved keys in the ports below, and
+    // assert the verbatim content lands in authorized_keys.
+    // -----------------------------------------------------------------
+
+    const EXISTING_PASSWD: &str = "\
+dbus:x:81:81:System Message Bus:/:/usr/bin/nologin
+root:x:0:0::/root:/bin/bash
+bin:x:1:1::/:/usr/bin/nologin
+daemon:x:2:2::/:/usr/bin/nologin
+mail:x:8:12::/var/spool/mail:/usr/bin/nologin
+ftp:x:14:11::/srv/ftp:/usr/bin/nologin
+http:x:33:33::/srv/http:/usr/bin/nologin
+systemd-coredump:x:980:980:systemd Core Dumper:/:/usr/bin/nologin
+systemd-network:x:979:979:systemd Network Management:/:/usr/bin/nologin
+systemd-oom:x:978:978:systemd Userspace OOM Killer:/:/usr/bin/nologin
+systemd-journal-remote:x:977:977:systemd Journal Remote:/:/usr/bin/nologin
+systemd-resolve:x:976:976:systemd Resolver:/:/usr/bin/nologin
+systemd-timesync:x:975:975:systemd Time Synchronization:/:/usr/bin/nologin
+tss:x:974:974:tss user for tpm2:/:/usr/bin/nologin
+uuidd:x:68:68::/:/usr/bin/nologin
+_talkd:x:973:973:User for legacy talkd server:/:/usr/bin/nologin
+avahi:x:972:972:Avahi mDNS/DNS-SD daemon:/:/usr/bin/nologin
+named:x:40:40:BIND DNS Server:/:/usr/bin/nologin
+colord:x:971:971:Color management daemon:/var/lib/colord:/usr/bin/nologin
+dnsmasq:x:970:970:dnsmasq daemon:/:/usr/bin/nologin
+gdm:x:120:120:Gnome Display Manager:/var/lib/gdm:/usr/bin/nologin
+geoclue:x:969:969:Geoinformation service:/var/lib/geoclue:/usr/bin/nologin
+git:x:968:968:git daemon user:/:/usr/bin/git-shell
+nm-openconnect:x:967:967:NetworkManager OpenConnect:/:/usr/bin/nologin
+nm-openvpn:x:966:966:NetworkManager OpenVPN:/:/usr/bin/nologin
+ntp:x:87:87:Network Time Protocol:/var/lib/ntp:/bin/false
+openvpn:x:965:965:OpenVPN:/:/usr/bin/nologin
+polkitd:x:102:102:PolicyKit daemon:/:/usr/bin/nologin
+rpc:x:32:32:Rpcbind Daemon:/var/lib/rpcbind:/usr/bin/nologin
+rpcuser:x:34:34:RPC Service User:/var/lib/nfs:/usr/bin/nologin
+rtkit:x:133:133:RealtimeKit:/proc:/usr/bin/nologin
+usbmux:x:140:140:usbmux user:/:/usr/bin/nologin
+nvidia-persistenced:x:143:143:NVIDIA Persistence Daemon:/:/usr/bin/nologin
+flatpak:x:964:964:Flatpak system helper:/:/usr/bin/nologin
+brltty:x:961:961:Braille Device Daemon:/var/lib/brltty:/usr/bin/nologin
+gluster:x:960:960:GlusterFS daemons:/var/run/gluster:/usr/bin/nologin
+qemu:x:959:959:QEMU user:/:/usr/bin/nologin
+libvirt-qemu:x:957:957:Libvirt QEMU user:/:/usr/bin/nologin
+fwupd:x:956:956:Firmware update daemon:/var/lib/fwupd:/usr/bin/nologin
+passim:x:955:955:Local Caching Server:/usr/share/empty:/usr/bin/nologin
+cups:x:209:209:cups helper user:/:/usr/bin/nologin
+saned:x:953:953:SANE daemon user:/:/usr/bin/nologin
+last:x:999:999:Test user for uid:/:/usr/bin/nologin
+";
+
+    /// Subset of default usernames that must survive the run untouched.
+    /// Mirrors `HaveAllDefaultUsers` from the Go suite (minus the
+    /// hyphen-prefixed `_talkd` which is also asserted there).
+    const DEFAULT_USERS: &[&str] = &[
+        "root",
+        "bin",
+        "daemon",
+        "mail",
+        "ftp",
+        "http",
+        "systemd-coredump",
+        "systemd-network",
+        "systemd-oom",
+        "systemd-journal-remote",
+        "systemd-resolve",
+        "systemd-timesync",
+        "tss",
+        "_talkd",
+        "uuidd",
+        "avahi",
+        "named",
+        "colord",
+        "dnsmasq",
+        "gdm",
+        "geoclue",
+        "git",
+        "nm-openconnect",
+        "nm-openvpn",
+        "ntp",
+        "openvpn",
+        "polkitd",
+        "rpc",
+        "rpcuser",
+        "rtkit",
+        "usbmux",
+        "nvidia-persistenced",
+        "flatpak",
+        "brltty",
+        "gluster",
+        "qemu",
+        "libvirt-qemu",
+        "fwupd",
+        "passim",
+        "cups",
+        "saned",
+        "last",
+    ];
+
+    /// Build a fresh VFS seeded with `EXISTING_PASSWD` plus the given
+    /// shadow/group contents — matches the Go `vfst.NewTestFS` calls.
+    fn seed_with(shadow: &str, group: &str) -> MemVfs {
+        let fs = MemVfs::new();
+        write(&fs, ETC_PASSWD, EXISTING_PASSWD);
+        write(&fs, ETC_SHADOW, shadow);
+        write(&fs, ETC_GROUP, group);
+        fs
+    }
+
+    /// Assert every name in `DEFAULT_USERS` still appears in /etc/passwd
+    /// after the run — Rust port of `HaveAllDefaultUsers()`.
+    fn assert_all_default_users(fs: &MemVfs) {
+        let passwd = read(fs, ETC_PASSWD);
+        let table = PasswdTable::parse(&passwd);
+        for name in DEFAULT_USERS {
+            assert!(
+                table.get(name).is_some(),
+                "default user `{name}` missing from /etc/passwd after run"
+            );
+        }
+    }
+
+    /// Look up a passwd row by name — convenience for the ports below.
+    fn get_passwd_row(fs: &MemVfs, name: &str) -> PasswdRow {
+        let passwd = read(fs, ETC_PASSWD);
+        PasswdTable::parse(&passwd)
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| panic!("user `{name}` not found in /etc/passwd"))
+    }
+
+    // Port of Go It: "change user password"
+    #[test]
+    fn go_change_user_password() {
+        let fs = seed_with("", "");
+        let con = RecordingConsole::new();
+
+        let stage = one_user(
+            "foo",
+            User {
+                password_hash: "$fkekofe".into(),
+                ssh_authorized_keys: vec![
+                    // Resolved equivalent of Go's `github:mudler` — the
+                    // Rust plugin writes verbatim, so we supply the key
+                    // we'd expect after upstream resolution.
+                    "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDR9zjXvyzg1HFMC7RT4LgtR+YGstxWDPPRoAcNrAWjtQcJVrcVo4WLFnT0BMU5mtMxWSrulpC6yrwnt2TE3Ul86yMxO2hbSyGP/xOdYm/nQzufY49rd3tKeJl1+6DkczuPa+XYh1GBcW5E2laNM5ZK+RjABppMpDgmnrM3AsGNE6G8RSuUvc/6Rwt61ma+jak3F5YMj4kwr5PhY2MTPo2YshsL3ouRXP/uPsbaBM6AdQakjWGJR8tPbrnHenzF65813d9zuY4y78TG0AHfomx9btmha7Mc0YF+BpELnvSQLlYrlRY/ziGhP65aQc8lFMc+XBnHeaXF4NHnzq6dIH2D".into(),
+                    "efafeeafea,t,t,pgl3,pbar".into(),
+                ],
+                ..Default::default()
+            },
+        );
+        run(&stage, &fs, &con).unwrap();
+
+        assert_all_default_users(&fs);
+
+        // /etc/group — exactly one entry for foo at GID 1000.
+        let group = read(&fs, ETC_GROUP);
+        assert_eq!(group, "foo:x:1000:foo\n", "got: {group}");
+
+        // /etc/shadow — verbatim $-prefixed password.
+        let shadow = read(&fs, ETC_SHADOW);
+        assert!(
+            shadow.contains("foo:$fkekofe:"),
+            "expected verbatim password, got: {shadow}"
+        );
+
+        // /etc/passwd row for foo — Created-by-entities GECOS, /home/foo,
+        // /bin/sh, password placeholder "x", UID 1000 (max existing was 999).
+        let foo = get_passwd_row(&fs, "foo");
+        assert_eq!(foo.gecos, "Created by entities");
+        assert_eq!(foo.homedir, "/home/foo");
+        assert_eq!(foo.shell, "/bin/sh");
+        assert_eq!(foo.password, "x");
+        assert_eq!(foo.uid, 1000);
+
+        // SSH keys land verbatim.
+        let ak = read(&fs, "/home/foo/.ssh/authorized_keys");
+        assert!(ak.contains("ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDR9zjXvyzg1HFMC7RT4LgtR+YGstxWDPPRoAcNrAWjtQcJVrcVo4WLFnT0BMU5mtMxWSrulpC6yrwnt2TE3Ul86yMxO2hbSyGP/xOdYm/nQzufY49rd3tKeJl1+6DkczuPa+XYh1GBcW5E2laNM5ZK+RjABppMpDgmnrM3AsGNE6G8RSuUvc/6Rwt61ma+jak3F5YMj4kwr5PhY2MTPo2YshsL3ouRXP/uPsbaBM6AdQakjWGJR8tPbrnHenzF65813d9zuY4y78TG0AHfomx9btmha7Mc0YF+BpELnvSQLlYrlRY/ziGhP65aQc8lFMc+XBnHeaXF4NHnzq6dIH2D"));
+        assert!(ak.contains("efafeeafea,t,t,pgl3,pbar"));
+    }
+
+    // Port of Go It: "set UID and Lockpasswd"
+    #[test]
+    fn go_set_uid_and_lock_passwd() {
+        let fs = seed_with("", "");
+        let con = RecordingConsole::new();
+
+        let stage = one_user(
+            "foo",
+            User {
+                password_hash: "$fkekofe".into(),
+                lock_passwd: true,
+                uid: "5000".into(),
+                homedir: "/run/foo".into(),
+                shell: "/bin/bash".into(),
+                ..Default::default()
+            },
+        );
+        run(&stage, &fs, &con).unwrap();
+
+        assert_all_default_users(&fs);
+
+        // /etc/group — GID still auto-allocated at 1000 regardless of UID.
+        let group = read(&fs, ETC_GROUP);
+        assert_eq!(group, "foo:x:1000:foo\n", "got: {group}");
+
+        // /etc/shadow — locked account stores "!" as the password field.
+        let shadow = read(&fs, ETC_SHADOW);
+        assert!(shadow.contains("foo:!:"), "got: {shadow}");
+
+        // /etc/passwd — explicit UID 5000, explicit homedir, explicit shell.
+        let foo = get_passwd_row(&fs, "foo");
+        assert_eq!(foo.gecos, "Created by entities");
+        assert_eq!(foo.homedir, "/run/foo");
+        assert_eq!(foo.shell, "/bin/bash");
+        assert_eq!(foo.password, "x");
+        assert_eq!(foo.uid, 5000);
+    }
+
+    // Port of Go It: "edits already existing user password"
+    #[test]
+    fn go_edits_already_existing_user_password() {
+        let shadow_seed = "\
+foo:$6$rfBd56ti$7juhxebonsy.GiErzyxZPkbm.U4lUlv/59D2pvFqlbjVqyJP5f4VgP.EX3FKAeGTAr.GVf0jQmy9BXAZL5mNJ1:18820::::::
+rancher:$6$2SMtYvSg$wL/zzuT4m3uYkHWO1Rl4x5U6BeGu9IfzIafueinxnNgLFHI34En35gu9evtlhizsOxRJLaTfy0bWFZfm2.qYu1:18820::::::";
+        let fs = seed_with(shadow_seed, "");
+        let con = RecordingConsole::new();
+
+        let stage = one_user(
+            "foo",
+            User {
+                password_hash: "$fkekofe".into(),
+                homedir: "/home/foo".into(),
+                ssh_authorized_keys: vec![
+                    "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDR9zjXvyzg1HFMC7RT4LgtR+YGstxWDPPRoAcNrAWjtQcJVrcVo4WLFnT0BMU5mtMxWSrulpC6yrwnt2TE3Ul86yMxO2hbSyGP/xOdYm/nQzufY49rd3tKeJl1+6DkczuPa+XYh1GBcW5E2laNM5ZK+RjABppMpDgmnrM3AsGNE6G8RSuUvc/6Rwt61ma+jak3F5YMj4kwr5PhY2MTPo2YshsL3ouRXP/uPsbaBM6AdQakjWGJR8tPbrnHenzF65813d9zuY4y78TG0AHfomx9btmha7Mc0YF+BpELnvSQLlYrlRY/ziGhP65aQc8lFMc+XBnHeaXF4NHnzq6dIH2D".into(),
+                    "efafeeafea,t,t,pgl3,pbar".into(),
+                ],
+                ..Default::default()
+            },
+        );
+        run(&stage, &fs, &con).unwrap();
+
+        assert_all_default_users(&fs);
+
+        // /etc/group — foo's primary group still allocated at 1000.
+        let group = read(&fs, ETC_GROUP);
+        assert_eq!(group, "foo:x:1000:foo\n", "got: {group}");
+
+        // /etc/shadow — old hash replaced with the new $fkekofe.
+        let shadow = read(&fs, ETC_SHADOW);
+        assert!(
+            shadow.contains("foo:$fkekofe:"),
+            "expected password to be replaced, got: {shadow}"
+        );
+
+        // /etc/passwd — defaults for the rest, UID = first free human (1000).
+        let foo = get_passwd_row(&fs, "foo");
+        assert_eq!(foo.gecos, "Created by entities");
+        assert_eq!(foo.homedir, "/home/foo");
+        assert_eq!(foo.shell, "/bin/sh");
+        assert_eq!(foo.password, "x");
+        assert_eq!(foo.uid, 1000);
+
+        // SSH keys are appended verbatim.
+        let ak = read(&fs, "/home/foo/.ssh/authorized_keys");
+        assert!(ak.contains("ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDR9zjXvyzg1HFMC7RT4LgtR+YGstxWDPPRoAcNrAWjtQcJVrcVo4WLFnT0BMU5mtMxWSrulpC6yrwnt2TE3Ul86yMxO2hbSyGP/xOdYm/nQzufY49rd3tKeJl1+6DkczuPa+XYh1GBcW5E2laNM5ZK+RjABppMpDgmnrM3AsGNE6G8RSuUvc/6Rwt61ma+jak3F5YMj4kwr5PhY2MTPo2YshsL3ouRXP/uPsbaBM6AdQakjWGJR8tPbrnHenzF65813d9zuY4y78TG0AHfomx9btmha7Mc0YF+BpELnvSQLlYrlRY/ziGhP65aQc8lFMc+XBnHeaXF4NHnzq6dIH2D"));
+        assert!(ak.contains("efafeeafea,t,t,pgl3,pbar"));
+    }
+
+    // Port of Go It: "preserves password aging fields when editing an existing user password"
+    #[test]
+    fn go_preserves_password_aging_fields_on_edit() {
+        let shadow_seed = "\
+foo:$6$rfBd56ti$7juhxebonsy.GiErzyxZPkbm.U4lUlv/59D2pvFqlbjVqyJP5f4VgP.EX3FKAeGTAr.GVf0jQmy9BXAZL5mNJ1:18820:1:365:14:30:20000:
+rancher:$6$2SMtYvSg$wL/zzuT4m3uYkHWO1Rl4x5U6BeGu9IfzIafueinxnNgLFHI34En35gu9evtlhizsOxRJLaTfy0bWFZfm2.qYu1:18820::::::";
+        let fs = seed_with(shadow_seed, "");
+        let con = RecordingConsole::new();
+
+        let stage = one_user(
+            "foo",
+            User {
+                password_hash: "$fkekofe".into(),
+                homedir: "/home/foo".into(),
+                ..Default::default()
+            },
+        );
+        run(&stage, &fs, &con).unwrap();
+
+        let shadow = read(&fs, ETC_SHADOW);
+        // Password field updated…
+        assert!(
+            shadow.contains("foo:$fkekofe:"),
+            "password should be updated, got: {shadow}"
+        );
+        // …but minimum/maximum-age, warn, inactive and expire are preserved.
+        assert!(
+            shadow.contains(":1:365:14:30:20000:"),
+            "aging fields should be preserved, got: {shadow}"
+        );
+    }
+
+    // Port of Go It: "adds users to group"
+    #[test]
+    fn go_adds_users_to_group() {
+        let fs = seed_with("", "");
+        let con = RecordingConsole::new();
+
+        // 1st apply: create `admin` user (auto-creates group `admin` at 1000).
+        run(
+            &one_user(
+                "admin",
+                User {
+                    password_hash: "$fkekofe".into(),
+                    homedir: "/home/foo".into(),
+                    ssh_authorized_keys: vec![
+                        "ssh-rsa AAAAresolved-key-admin user@host".into(),
+                        "efafeeafea,t,t,pgl3,pbar".into(),
+                    ],
+                    ..Default::default()
+                },
+            ),
+            &fs,
+            &con,
+        )
+        .unwrap();
+
+        // 2nd apply: create `bar` with secondary group `admin`.
+        run(
+            &one_user(
+                "bar",
+                User {
+                    groups: vec!["admin".into()],
+                    password_hash: "$fkekofe".into(),
+                    homedir: "/home/foo".into(),
+                    ssh_authorized_keys: vec![
+                        "ssh-rsa AAAAresolved-key-bar user@host".into(),
+                        "efafeeafea,t,t,pgl3,pbar".into(),
+                    ],
+                    ..Default::default()
+                },
+            ),
+            &fs,
+            &con,
+        )
+        .unwrap();
+
+        let group = read(&fs, ETC_GROUP);
+        assert_eq!(
+            group, "admin:x:1000:admin,bar\nbar:x:1001:bar\n",
+            "got: {group}"
+        );
+
+        // 3rd apply: create `baz` also in admin.
+        run(
+            &one_user(
+                "baz",
+                User {
+                    homedir: "/home/foo".into(),
+                    groups: vec!["admin".into()],
+                    ..Default::default()
+                },
+            ),
+            &fs,
+            &con,
+        )
+        .unwrap();
+
+        let group = read(&fs, ETC_GROUP);
+        assert_eq!(
+            group, "admin:x:1000:admin,bar,baz\nbar:x:1001:bar\nbaz:x:1002:baz\n",
+            "got: {group}"
+        );
+    }
+
+    // Port of Go It: "Recreates users with the same UID() and in order"
+    //
+    // Apply 4 users (a, bar, foo, x) twice against fresh-but-identically-
+    // seeded filesystems and assert the auto-allocated UIDs are stable
+    // across runs (UID stability test).
+    #[test]
+    fn go_recreates_users_with_same_uid_in_order() {
+        // Users sorted alphabetically → a=1000, bar=1001, foo=1002, x=1003.
+        let users: &[&str] = &["a", "bar", "foo", "x"];
+
+        let build_stage = || {
+            let mut stage_users: HashMap<String, User> = HashMap::new();
+            for n in users {
+                stage_users.insert(
+                    (*n).to_string(),
+                    User {
+                        password_hash: "$fkekofe".into(),
+                        ..Default::default()
+                    },
+                );
+            }
+            Stage {
+                users: stage_users,
+                ..Default::default()
+            }
+        };
+
+        let assert_layout = |fs: &MemVfs| {
+            assert_all_default_users(fs);
+
+            let a = get_passwd_row(fs, "a");
+            assert_eq!(a.gecos, "Created by entities");
+            assert_eq!(a.homedir, "/home/a");
+            assert_eq!(a.shell, "/bin/sh");
+            assert_eq!(a.password, "x");
+            assert_eq!(a.uid, 1000);
+
+            let bar = get_passwd_row(fs, "bar");
+            assert_eq!(bar.gecos, "Created by entities");
+            assert_eq!(bar.homedir, "/home/bar");
+            assert_eq!(bar.shell, "/bin/sh");
+            assert_eq!(bar.password, "x");
+            assert_eq!(bar.uid, 1001);
+
+            let foo = get_passwd_row(fs, "foo");
+            assert_eq!(foo.gecos, "Created by entities");
+            assert_eq!(foo.homedir, "/home/foo");
+            assert_eq!(foo.shell, "/bin/sh");
+            assert_eq!(foo.password, "x");
+            assert_eq!(foo.uid, 1002);
+
+            let x = get_passwd_row(fs, "x");
+            assert_eq!(x.gecos, "Created by entities");
+            assert_eq!(x.homedir, "/home/x");
+            assert_eq!(x.shell, "/bin/sh");
+            assert_eq!(x.password, "x");
+            assert_eq!(x.uid, 1003);
+        };
+
+        // First fresh VFS.
+        let con = RecordingConsole::new();
+        let fs = seed_with("", "");
+        run(&build_stage(), &fs, &con).unwrap();
+        assert_layout(&fs);
+
+        // Manual "cleanup" — a brand-new VFS seeded identically.
+        let fs2 = seed_with("", "");
+        run(&build_stage(), &fs2, &con).unwrap();
+        assert_layout(&fs2);
+    }
+
+    // Port of Go It: "Creates the user multiple times, keeping the same UID()"
+    //
+    // Apply the same single-user stage 5 times against the same VFS;
+    // foo's UID must remain 1000 (no drift, no duplicate rows).
+    #[test]
+    fn go_creates_user_multiple_times_keeping_same_uid() {
+        let fs = seed_with("", "");
+        let con = RecordingConsole::new();
+
+        let stage = one_user(
+            "foo",
+            User {
+                password_hash: "$fkekofe".into(),
+                ..Default::default()
+            },
+        );
+        for _ in 0..5 {
+            run(&stage, &fs, &con).unwrap();
+        }
+
+        assert_all_default_users(&fs);
+
+        let foo = get_passwd_row(&fs, "foo");
+        assert_eq!(foo.gecos, "Created by entities");
+        assert_eq!(foo.homedir, "/home/foo");
+        assert_eq!(foo.shell, "/bin/sh");
+        assert_eq!(foo.password, "x");
+        assert_eq!(foo.uid, 1000, "UID must remain stable across re-applies");
+
+        // No duplicate passwd row for foo across the 5 applies.
+        let passwd = read(&fs, ETC_PASSWD);
+        let foo_lines = passwd.lines().filter(|l| l.starts_with("foo:")).count();
+        assert_eq!(foo_lines, 1, "duplicated passwd line: {passwd}");
+    }
+
+    // Port of Go It: "Creates the user multiple times, keeping the same
+    // UID(), even if a new users is added"
+    //
+    // Apply `foo` first (gets UID 1000), then apply {a, b, foo} together
+    // — foo must keep 1000 while a, b get the next free slots (1001, 1002).
+    #[test]
+    fn go_creates_user_multiple_times_keeping_same_uid_with_new_users() {
+        let fs = seed_with("", "");
+        let con = RecordingConsole::new();
+
+        // First apply: just foo.
+        run(
+            &one_user(
+                "foo",
+                User {
+                    password_hash: "$fkekofe".into(),
+                    ..Default::default()
+                },
+            ),
+            &fs,
+            &con,
+        )
+        .unwrap();
+
+        // Second apply: a, b, foo — sorted alphabetically by the plugin.
+        let mut new_users: HashMap<String, User> = HashMap::new();
+        for n in ["a", "b", "foo"] {
+            new_users.insert(
+                n.to_string(),
+                User {
+                    password_hash: "$fkekofe".into(),
+                    ..Default::default()
+                },
+            );
+        }
+        run(
+            &Stage {
+                users: new_users,
+                ..Default::default()
+            },
+            &fs,
+            &con,
+        )
+        .unwrap();
+
+        assert_all_default_users(&fs);
+
+        // foo's UID didn't drift.
+        let foo = get_passwd_row(&fs, "foo");
+        assert_eq!(foo.gecos, "Created by entities");
+        assert_eq!(foo.homedir, "/home/foo");
+        assert_eq!(foo.shell, "/bin/sh");
+        assert_eq!(foo.password, "x");
+        assert_eq!(foo.uid, 1000);
+
+        // a got the next free slot…
+        let a = get_passwd_row(&fs, "a");
+        assert_eq!(a.gecos, "Created by entities");
+        assert_eq!(a.homedir, "/home/a");
+        assert_eq!(a.shell, "/bin/sh");
+        assert_eq!(a.password, "x");
+        assert_eq!(a.uid, 1001);
+
+        // …and b the one after.
+        let b = get_passwd_row(&fs, "b");
+        assert_eq!(b.gecos, "Created by entities");
+        assert_eq!(b.homedir, "/home/b");
+        assert_eq!(b.shell, "/bin/sh");
+        assert_eq!(b.password, "x");
+        assert_eq!(b.uid, 1002);
+    }
 }

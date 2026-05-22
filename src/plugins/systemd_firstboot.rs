@@ -188,6 +188,36 @@ mod tests {
         assert!(!cmds[0].contains("--prompt-keymap=true"));
     }
 
+    // -------------------------------------------------------------------
+    // Direct port of the Go `It` block in pkg/plugins/systemd_firstboot_test.go.
+    // -------------------------------------------------------------------
+
+    /// Go: "sets first-boot configuration"
+    #[test]
+    fn go_port_sets_first_boot_configuration() {
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+
+        let mut m = HashMap::new();
+        m.insert("keymap".into(), "us".into());
+        m.insert("LOCALE".into(), "en_US.UTF-8".into());
+        m.insert("force".into(), "true".into());
+        let stage = Stage {
+            systemd_firstboot: m,
+            ..Default::default()
+        };
+        run(&stage, &fs, &console).expect("err nil");
+
+        let cmds = console.commands();
+        // Go: ContainElements("systemd-firstboot --force --keymap=us --locale=en_US.UTF-8")
+        // and len == 1.
+        assert_eq!(cmds.len(), 1);
+        assert!(
+            cmds.contains(&"systemd-firstboot --force --keymap=us --locale=en_US.UTF-8".to_string()),
+            "expected command in {cmds:?}"
+        );
+    }
+
     #[test]
     fn empty_value_emits_key_equals_empty() {
         // Edge: value is "" (not "true") — emits --key= with nothing on the RHS.

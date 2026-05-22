@@ -264,6 +264,27 @@ mod tests {
         assert_eq!(got, "");
     }
 
+    // -------------------------------------------------------------------
+    // Direct port of the Go `It` block in pkg/plugins/sysctl_test.go.
+    // -------------------------------------------------------------------
+
+    /// Go: "configures a /sys/proc setting"
+    #[test]
+    fn go_port_configures_sysproc_setting() {
+        let fs = MemVfs::new();
+        // vfst NewTestFS({"/proc/sys/debug/.keep": ""})
+        fs.write(Path::new("/proc/sys/debug/.keep"), b"").unwrap();
+        let console = RecordingConsole::new();
+
+        let stage = stage_sysctl(&[("debug.exception-trace", "0")]);
+        run(&stage, &fs, &console).expect("err nil");
+
+        let body = fs
+            .read_to_string(Path::new("/proc/sys/debug/exception-trace"))
+            .expect("open exception-trace");
+        assert_eq!(body, "0");
+    }
+
     #[test]
     fn read_only_sysctl_path_failure_captured_in_multi() {
         // Mock a read-only target — the write call returns an error, and the

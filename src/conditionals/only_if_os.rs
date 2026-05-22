@@ -339,4 +339,37 @@ mod tests {
         };
         assert_eq!(run(&stage, &vfs), ConditionalOutcome::Skip);
     }
+
+    // --- Direct ports of Go's `if_test.go` `IfOsConditional` Describe ---
+    // Source: yip/pkg/plugins/if_test.go, Describe("IfOsConditional"), 1 It block.
+    //
+    // Divergence note: Go asserts on the textual error message (contains
+    // `SkipOnlyOs` formatted with "weird" and the literal "doesn't match os
+    // name"). The Rust port collapses conditional errors into
+    // `ConditionalOutcome::Skip` (see module docstring), so we assert on the
+    // outcome instead. The semantic ("weird" does not match a real os name
+    // and the stage must be skipped) is preserved.
+
+    /// Go: `Describe("IfOsConditional") It("Executes")` — pattern "weird"
+    /// against the host's NAME must Skip. Go's test uses the host's real
+    /// `/etc/os-release`; we use `MemVfs` with an empty file so the
+    /// behaviour is deterministic across CI hosts. With no NAME field the
+    /// implementation skips, which matches the Go expectation of a failing
+    /// conditional.
+    #[test]
+    fn go_port_if_os_conditional_executes_weird_pattern_skips() {
+        let vfs = MemVfs::new();
+        // Mirror Go's BeforeEach which only seeds /etc/hostname and
+        // /etc/hosts (no /etc/os-release). We provide an empty os-release
+        // so the read succeeds but the NAME parse returns empty.
+        write_os_release(&vfs, "");
+        let console = RecordingConsole::default();
+        let stage = Stage {
+            only_if_os: "weird".into(),
+            ..Default::default()
+        };
+        let out = check(&stage, &vfs, &console).expect("check ok");
+        assert_eq!(out, ConditionalOutcome::Skip);
+        assert!(console.commands().is_empty());
+    }
 }

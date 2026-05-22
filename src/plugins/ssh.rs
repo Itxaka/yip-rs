@@ -654,6 +654,64 @@ mod tests {
         assert!(got.contains("ssh-rsa AAAA-brand-new pre@new"));
     }
 
+    // -------------------------------------------------------------------
+    // Direct port of the Go `It` block in pkg/plugins/ssh_test.go.
+    //
+    // Go fetches keys from real github.com/mudler.keys. We point the
+    // github URL template at a mockito server and return a body that
+    // contains the historically-stable RSA key chunk that Go asserts on.
+    // -------------------------------------------------------------------
+
+    /// Go: "configures a user authorized_key"
+    #[test]
+    fn go_port_configures_user_authorized_key() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let mut server = mockito::Server::new();
+        // The exact key chunk the Go test asserts on (a public chunk of
+        // github.com/mudler.keys, pinned by the upstream test).
+        let github_body = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDR9zjXvyzg1HFMC7RT4LgtR+YGstxWDPPRoAcNrAWjtQcJVrcVo4WLFnT0BMU5mtMxWSrulpC6yrwnt2TE3Ul86yMxO2hbSyGP/xOdYm/nQzufY49rd3tKeJl1+6DkczuPa+XYh1GBcW5E2laNM5ZK+RjABppMpDgmnrM3AsGNE6G8RSuUvc/6Rwt61ma+jak3F5YMj4kwr5PhY2MTPo2YshsL3ouRXP/uPsbaBM6AdQakjWGJR8tPbrnHenzF65813d9zuY4y78TG0AHfomx9btmha7Mc0YF+BpELnvSQLlYrlRY/ziGhP65aQc8lFMc+XBnHeaXF4NHnzq6dIH2D mudler@github\n";
+        let m = server
+            .mock("GET", "/mudler.keys")
+            .with_status(200)
+            .with_body(github_body)
+            .create();
+        let template = format!("{}/%s.keys", server.url());
+        std::env::set_var("YIP_SSH_GITHUB_URL_TEMPLATE", &template);
+
+        // vfst NewTestFS({
+        //   "/etc/passwd":     `foo:x:1000:100:foo:/home/foo:/bin/zsh`,
+        //   "/home/foo/.keep": "",
+        // })
+        let fs = MemVfs::new();
+        fs.write(
+            Path::new("/etc/passwd"),
+            b"foo:x:1000:100:foo:/home/foo:/bin/zsh",
+        )
+        .unwrap();
+        fs.write(Path::new("/home/foo/.keep"), b"").unwrap();
+
+        let console = RecordingConsole::new();
+        let mut stage = Stage::default();
+        stage.ssh_keys.insert(
+            "foo".to_string(),
+            vec!["efafeeafea,t,t,pgl3,pbar".to_string(), "github:mudler".to_string()],
+        );
+
+        let _res = run(&stage, &fs, &console);
+        std::env::remove_var("YIP_SSH_GITHUB_URL_TEMPLATE");
+        m.assert();
+
+        let body = fs
+            .read_to_string(Path::new("/home/foo/.ssh/authorized_keys"))
+            .expect("open authorized_keys");
+        // Go: ContainSubstring("ssh-rsa AAAAB3NzaC1...IH2D")
+        assert!(
+            body.contains("ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDR9zjXvyzg1HFMC7RT4LgtR+YGstxWDPPRoAcNrAWjtQcJVrcVo4WLFnT0BMU5mtMxWSrulpC6yrwnt2TE3Ul86yMxO2hbSyGP/xOdYm/nQzufY49rd3tKeJl1+6DkczuPa+XYh1GBcW5E2laNM5ZK+RjABppMpDgmnrM3AsGNE6G8RSuUvc/6Rwt61ma+jak3F5YMj4kwr5PhY2MTPo2YshsL3ouRXP/uPsbaBM6AdQakjWGJR8tPbrnHenzF65813d9zuY4y78TG0AHfomx9btmha7Mc0YF+BpELnvSQLlYrlRY/ziGhP65aQc8lFMc+XBnHeaXF4NHnzq6dIH2D"),
+            "expected github key in {body:?}"
+        );
+        assert!(body.contains("efafeeafea,t,t,pgl3,pbar"), "got: {body:?}");
+    }
+
     #[test]
     fn user_with_empty_homedir_in_passwd_is_skipped_silently() {
         // Build a passwd entry by hand so the home field is empty.

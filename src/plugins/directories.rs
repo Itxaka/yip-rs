@@ -367,4 +367,93 @@ mod tests {
             assert_eq!(m.mode, mode, "round-trip for {:o}", mode);
         }
     }
+
+    // -------------------------------------------------------------------
+    // Direct ports of the Go `It` blocks in pkg/plugins/dir_test.go.
+    // Each test mirrors one Ginkgo `It` from the upstream yip test suite.
+    // -------------------------------------------------------------------
+
+    /// Go: "Creates a /tmp/dir directory"
+    #[test]
+    fn go_port_creates_tmp_dir_directory() {
+        let fs = MemVfs::new();
+        fs.mkdir_all(Path::new("/tmp")).unwrap();
+        fs.chmod(Path::new("/tmp"), 0o755).unwrap();
+        let console = RecordingConsole::new();
+
+        // os.Getuid() / os.Getgid() — pick the running user's IDs.
+        let uid = unsafe { libc::getuid() } as i32;
+        let gid = unsafe { libc::getgid() } as i32;
+        let stage = Stage {
+            directories: vec![Directory {
+                path: "/tmp/dir".to_string(),
+                permissions: 0o740,
+                owner: OwnerId::Numeric(uid),
+                group: gid,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        run(&stage, &fs, &console).expect("err nil");
+        let m = fs.metadata(Path::new("/tmp/dir")).expect("stat");
+        assert_eq!(m.mode & 0o7777, 0o740);
+    }
+
+    /// Go: "Changes permissions of existing directory /tmp/dir directory"
+    #[test]
+    fn go_port_changes_permissions_of_existing_dir() {
+        let fs = MemVfs::new();
+        fs.mkdir_all(Path::new("/tmp/dir")).unwrap();
+        fs.chmod(Path::new("/tmp/dir"), 0o755).unwrap();
+        let console = RecordingConsole::new();
+
+        let m = fs.metadata(Path::new("/tmp/dir")).expect("pre-stat");
+        assert_eq!(m.mode & 0o7777, 0o755);
+
+        let uid = unsafe { libc::getuid() } as i32;
+        let gid = unsafe { libc::getgid() } as i32;
+        let stage = Stage {
+            directories: vec![Directory {
+                path: "/tmp/dir".to_string(),
+                permissions: 0o740,
+                owner: OwnerId::Numeric(uid),
+                group: gid,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        run(&stage, &fs, &console).expect("err nil");
+        let m = fs.metadata(Path::new("/tmp/dir")).expect("post-stat");
+        assert_eq!(m.mode & 0o7777, 0o740);
+    }
+
+    /// Go: "Creates /tmp/dir/subdir1/subdir2 directory and its missing parent dirs"
+    #[test]
+    fn go_port_creates_nested_with_missing_parents() {
+        let fs = MemVfs::new();
+        fs.mkdir_all(Path::new("/tmp")).unwrap();
+        fs.chmod(Path::new("/tmp"), 0o755).unwrap();
+        let console = RecordingConsole::new();
+
+        let uid = unsafe { libc::getuid() } as i32;
+        let gid = unsafe { libc::getgid() } as i32;
+        let stage = Stage {
+            directories: vec![Directory {
+                path: "/tmp/dir/subdir1/subdir2".to_string(),
+                permissions: 0o740,
+                owner: OwnerId::Numeric(uid),
+                group: gid,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        run(&stage, &fs, &console).expect("err nil");
+
+        let m = fs.metadata(Path::new("/tmp")).expect("stat tmp");
+        assert_eq!(m.mode & 0o7777, 0o755);
+        let m = fs
+            .metadata(Path::new("/tmp/dir/subdir1/subdir2"))
+            .expect("stat leaf");
+        assert_eq!(m.mode & 0o7777, 0o740);
+    }
 }

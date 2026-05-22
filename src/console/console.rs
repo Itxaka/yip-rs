@@ -610,4 +610,47 @@ mod tests {
         // Only first %s consumed.
         assert_eq!(render_printf("%s and %s", "A"), "A and %s");
     }
+
+    // ---- edge cases ----
+
+    #[test]
+    fn standard_run_empty_cmd_returns_ok_empty() {
+        // `/bin/sh -c ""` is a documented no-op that exits 0. The Console
+        // contract doesn't promise an error here; document the actual
+        // behaviour so a future change to error-on-empty would be a
+        // deliberate, test-visible decision.
+        let c = StandardConsole::new();
+        let out = c.run("").expect("empty cmd is no-op success on /bin/sh");
+        assert!(out.is_empty(), "expected no output, got {out:?}");
+    }
+
+    #[test]
+    fn standard_run_large_stdout_1mib() {
+        // 1 MiB of 'a's via `yes` would be unbounded; use head -c to cap.
+        // The point is to make sure we don't truncate large stdout.
+        let c = StandardConsole::new();
+        let out = c
+            .run("head -c 1048576 /dev/zero | tr '\\0' a")
+            .expect("large stdout should succeed");
+        assert_eq!(out.len(), 1024 * 1024);
+        assert!(out.chars().all(|c| c == 'a'));
+    }
+
+    #[test]
+    fn standard_run_in_nonexistent_cwd_errors() {
+        let c = StandardConsole::new();
+        let err = c
+            .run_in(Path::new("/definitely/not/here/at/all"), "true")
+            .expect_err("nonexistent cwd should fail");
+        // Either spawn failed (status=None) or sh resolved cwd before
+        // exec — both surface as Error::Cmd.
+        assert!(matches!(err, Error::Cmd { .. }));
+    }
+
+    #[test]
+    fn run_template_empty_cmds_is_noop() {
+        let c = RecordingConsole::new();
+        c.run_template(&[], "systemctl enable %s").expect("empty cmds is no-op");
+        assert!(c.commands().is_empty());
+    }
 }

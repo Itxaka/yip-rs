@@ -449,4 +449,82 @@ mod tests {
         // verify the deeper path landed.
         assert_eq!(v["a"]["b"], Value::String("w".into()));
     }
+
+    // ---------------------------------------------------------------------
+    // Verbatim port of Go's `schema_test.go` "Loading from dot notation"
+    // Context. Each It block lifts the same fixture string and asserts on
+    // the resulting `Config` (not just the raw YAML value tree) — matching
+    // Go's `yipConfig.Stages["foo"][0].Name` style.
+    //
+    //     oneConfigwithGarbageS := "stages.foo[0].name=bar boo.baz"
+    //     twoConfigsS           := "stages.foo[0].name=bar   stages.foo[0].commands[0]=baz"
+    //     threeConfigInvalid    := `ip=dhcp test="echo ping_test_host=127.0.0.1  > /tmp/jojo"`
+    //     fourConfigHalfInvalid := `stages.foo[0].name=bar ip=dhcp test="echo ping_test_host=127.0.0.1  > /tmp/dio"`
+    // ---------------------------------------------------------------------
+
+    use crate::schema::Config;
+
+    /// Go It #1: `loadYip(oneConfigwithGarbageS)`; asserts
+    /// `yipConfig.Stages["foo"][0].Name == "bar"`.
+    #[test]
+    fn go_it_reads_yip_file_correctly_one_config_with_garbage() {
+        let yaml = dot_notation_modifier(b"stages.foo[0].name=bar boo.baz").unwrap();
+        let cfg = Config::load(&yaml).unwrap();
+        assert_eq!(cfg.stages["foo"][0].name, "bar");
+    }
+
+    /// Go It #2: `loadYip(twoConfigsS)`; asserts both `Name` and
+    /// `Commands[0]`.
+    #[test]
+    fn go_it_reads_yip_file_correctly_two_configs() {
+        let yaml =
+            dot_notation_modifier(b"stages.foo[0].name=bar   stages.foo[0].commands[0]=baz")
+                .unwrap();
+        let cfg = Config::load(&yaml).unwrap();
+        assert_eq!(cfg.stages["foo"][0].name, "bar");
+        assert_eq!(cfg.stages["foo"][0].commands[0], "baz");
+    }
+
+    /// Go It #3: `Load(twoConfigsS, nil, nil, DotNotationModifier)` —
+    /// passes the dot-notation string straight into the loader. In Rust
+    /// we run the modifier then `Config::load`; the assertions match Go.
+    #[test]
+    fn go_it_reads_yip_file_correctly_two_configs_via_loader() {
+        let yaml =
+            dot_notation_modifier(b"stages.foo[0].name=bar   stages.foo[0].commands[0]=baz")
+                .unwrap();
+        let cfg = Config::load(&yaml).unwrap();
+        assert_eq!(cfg.stages["foo"][0].name, "bar");
+        assert_eq!(cfg.stages["foo"][0].commands[0], "baz");
+    }
+
+    /// Go It #4: `threeConfigInvalid` has no `stages.*` token, so the
+    /// resulting `Config` should look like the zero value — `Stages` and
+    /// `Name` match `Config::default()`.
+    #[test]
+    fn go_it_reads_yip_file_correctly_three_invalid_yields_empty_config() {
+        let yaml = dot_notation_modifier(
+            br#"ip=dhcp test="echo ping_test_host=127.0.0.1  > /tmp/jojo""#,
+        )
+        .unwrap();
+        let cfg = Config::load(&yaml).unwrap();
+        // Should look like an empty YipConfig as it's an invalid config —
+        // nothing in `Stages`, no `Name`.
+        assert_eq!(cfg.stages, Config::default().stages);
+        assert_eq!(cfg.name, Config::default().name);
+    }
+
+    /// Go It #5: `fourConfigHalfInvalid` — even with garbage tokens, the
+    /// valid `stages.foo[0].name=bar` portion still loads.
+    #[test]
+    fn go_it_reads_yip_file_correctly_four_half_invalid_loads_valid_part() {
+        let yaml = dot_notation_modifier(
+            br#"stages.foo[0].name=bar ip=dhcp test="echo ping_test_host=127.0.0.1  > /tmp/dio""#,
+        )
+        .unwrap();
+        let cfg = Config::load(&yaml).unwrap();
+        assert_eq!(cfg.name, Config::default().name);
+        // Even with a broken config, the valid parts must still load.
+        assert_eq!(cfg.stages["foo"][0].name, "bar");
+    }
 }

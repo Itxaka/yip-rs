@@ -263,4 +263,123 @@ mod tests {
         let vfs = RealVfs::new();
         trait_roundtrip(&vfs, dir.path());
     }
+
+    // ---- edge cases ----
+
+    #[test]
+    fn binary_data_with_nulls_and_non_utf8() {
+        let dir = td();
+        let vfs = RealVfs::new();
+        let p = dir.path().join("bin");
+        // Mixed nulls + non-UTF-8 bytes (0xFF/0xFE never appear in valid UTF-8).
+        let payload: Vec<u8> = vec![0x00, 0xFF, 0x00, 0xFE, 0x7F, 0x80, 0x00, 0x00];
+        vfs.write(&p, &payload).unwrap();
+        assert_eq!(vfs.read(&p).unwrap(), payload);
+        // read_to_string must fail cleanly (not panic) for non-UTF-8.
+        assert!(vfs.read_to_string(&p).is_err());
+    }
+
+    #[test]
+    fn read_dir_empty_vs_hundred_entries() {
+        let dir = td();
+        let vfs = RealVfs::new();
+        let empty = dir.path().join("empty");
+        vfs.mkdir_all(&empty).unwrap();
+        assert_eq!(vfs.read_dir(&empty).unwrap().len(), 0);
+
+        let big = dir.path().join("big");
+        vfs.mkdir_all(&big).unwrap();
+        for i in 0..100 {
+            vfs.write(&big.join(format!("f{i:03}")), b"x").unwrap();
+        }
+        let mut entries = vfs.read_dir(&big).unwrap();
+        assert_eq!(entries.len(), 100);
+        // After sorting we should see f000..f099 in order.
+        entries.sort();
+        let first = entries[0].file_name().unwrap().to_string_lossy().into_owned();
+        let last = entries[99].file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(first, "f000");
+        assert_eq!(last, "f099");
+    }
+
+    #[test]
+    fn walk_with_dangling_symlink() {
+        let dir = td();
+        let vfs = RealVfs::new();
+        let target = dir.path().join("does-not-exist");
+        let link = dir.path().join("dangling");
+        vfs.symlink(&target, &link).unwrap();
+        // Walk shouldn't blow up. follow_links(false) means the dangling
+        // symlink is just skipped (it's not a regular file).
+        let files = vfs.walk(dir.path()).unwrap();
+        assert!(files.iter().all(|p| p != &link));
+    }
+
+    #[test]
+    fn mkdir_all_when_component_is_a_file_errors() {
+        let dir = td();
+        let vfs = RealVfs::new();
+        let f = dir.path().join("blocker");
+        vfs.write(&f, b"x").unwrap();
+        // Trying to mkdir under a regular file must fail.
+        let err = vfs.mkdir_all(&f.join("child")).unwrap_err();
+        assert!(matches!(err, Error::Io { .. }));
+    }
+
+    #[test]
+    fn chmod_on_missing_path_errors() {
+        let dir = td();
+        let vfs = RealVfs::new();
+        let err = vfs.chmod(&dir.path().join("nope"), 0o600).unwrap_err();
+        assert!(matches!(err, Error::Io { .. }));
+    }
+
+    #[test]
+    fn chown_neg_one_neg_one_is_noop() {
+        let dir = td();
+        let vfs = RealVfs::new();
+        let p = dir.path().join("f");
+        vfs.write(&p, b"x").unwrap();
+        // Should succeed (or at worst return EPERM if we're not root)
+        // — the important thing is that (-1, -1) doesn't try to set
+        // anything and the existing owner is preserved.
+        let before = vfs.metadata(&p).unwrap();
+        let _ = vfs.chown(&p, -1, -1);
+        let after = vfs.metadata(&p).unwrap();
+        assert_eq!((before.uid, before.gid), (after.uid, after.gid));
+    }
+
+    #[test]
+    fn remove_all_missing_is_idempotent() {
+        let dir = td();
+        let vfs = RealVfs::new();
+        let missing = dir.path().join("never-existed");
+        vfs.remove_all(&missing).unwrap();
+        vfs.remove_all(&missing).unwrap();
+    }
+
+    #[test]
+    fn write_overwrites_existing_with_truncation() {
+        let dir = td();
+        let vfs = RealVfs::new();
+        let p = dir.path().join("ow");
+        vfs.write(&p, b"longer original content").unwrap();
+        // Overwrite with shorter — must truncate, not leave trailing bytes.
+        vfs.write(&p, b"hi").unwrap();
+        assert_eq!(vfs.read(&p).unwrap(), b"hi");
+        assert_eq!(vfs.metadata(&p).unwrap().size, 2);
+    }
+
+    #[test]
+    fn symlink_loop_walk_terminates() {
+        let dir = td();
+        let vfs = RealVfs::new();
+        // a -> b, b -> a. Walk uses follow_links(false) so it shouldn't
+        // recurse, but make sure it definitely terminates.
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        vfs.symlink(&b, &a).unwrap();
+        vfs.symlink(&a, &b).unwrap();
+        let _files = vfs.walk(dir.path()).unwrap();
+    }
 }

@@ -317,4 +317,107 @@ mod tests {
         let out = render("{{ .Name | lower }}", &data).unwrap();
         assert_eq!(out, "kairos");
     }
+
+    // -----------------------------------------------------------------
+    // Extended edge-case tests.
+
+    #[test]
+    fn render_deep_nested_field_access() {
+        // Five levels deep: exercises tera's dotted-path resolver on a
+        // structure that mirrors the typical `Values.X.Y.Z` shape.
+        let data = json!({
+            "Values": {
+                "A": { "B": { "C": { "D": { "E": "deep" } } } }
+            }
+        });
+        let out = render("{{ .Values.A.B.C.D.E }}", &data).unwrap();
+        assert_eq!(out, "deep");
+    }
+
+    #[test]
+    fn render_escaped_braces_via_raw_block() {
+        // Tera lets us emit literal `{{` / `}}` via `{% raw %}` blocks.
+        // Go uses `{{"{{"}}` for the same purpose, but yip configs in
+        // practice rely on tera's raw block when they need to ship the
+        // delimiters verbatim. Verify the engine passes them through.
+        let out = render("{% raw %}{{ literal }}{% endraw %}", &Value::Null).unwrap();
+        assert_eq!(out, "{{ literal }}");
+    }
+
+    #[test]
+    fn render_multiple_substitutions_one_line() {
+        let data = json!({"First": "kai", "Second": "ros"});
+        let out = render("{{ .First }}-{{ .Second }}/{{ .First }}{{ .Second }}", &data).unwrap();
+        assert_eq!(out, "kai-ros/kairos");
+    }
+
+    #[test]
+    fn render_multi_line_control_flow_if() {
+        // Tera's control-flow syntax uses `{% if %}` (Go's `{{ if }}` is
+        // intentionally not bridged — kairos configs that need branching
+        // already use tera syntax). This exercises the multi-line path.
+        let data = json!({"flag": true, "Name": "kairos"});
+        let tmpl = "\
+{% if flag -%}
+hello {{ .Name }}
+{%- endif %}";
+        let out = render(tmpl, &data).unwrap();
+        assert_eq!(out, "hello kairos");
+    }
+
+    #[test]
+    fn render_sprig_chain_upper_quote() {
+        // Filter chain: literal -> upper -> quote.
+        let out = render(r#"{{ "abc" | upper | quote }}"#, &Value::Null).unwrap();
+        assert_eq!(out, "\"ABC\"");
+    }
+
+    #[test]
+    fn render_non_existent_variable_errors() {
+        // By default tera errors on undefined variables. Verify we
+        // surface that as a `Template` error rather than silently
+        // emitting an empty string.
+        let res = render("{{ .DoesNotExist }}", &Value::Null);
+        assert!(res.is_err(), "expected error for undefined variable");
+    }
+
+    #[test]
+    fn render_special_chars_in_values() {
+        // Values containing characters that have meaning in shells or
+        // YAML must round-trip verbatim through the engine.
+        let data = json!({"v": "a,b%c$d#e\""});
+        let out = render("[{{ .v }}]", &data).unwrap();
+        assert_eq!(out, "[a,b%c$d#e\"]");
+    }
+
+    #[test]
+    fn render_whitespace_trim_dashes_preserved() {
+        // `{{- ... -}}` is Go-style trim; preprocess strips the dashes
+        // so the surrounding whitespace ends up controlled by tera's
+        // default behaviour. The key invariant is that the inner field
+        // resolves and the surrounding text is preserved.
+        let data = json!({"Name": "kairos"});
+        let out = render("foo {{- .Name -}} bar", &data).unwrap();
+        assert!(out.contains("kairos"));
+        assert!(out.contains("foo"));
+        assert!(out.contains("bar"));
+    }
+
+    #[test]
+    fn render_round_trip_idempotent() {
+        // Rendering twice with the same data must produce identical
+        // output — there must be no hidden state in the engine.
+        let data = json!({"Values": {"System": {"OS": {"Name": "kairos"}}}});
+        let tmpl = "{{ .Values.System.OS.Name }}";
+        let first = render(tmpl, &data).unwrap();
+        let second = render(tmpl, &data).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first, "kairos");
+    }
+
+    #[test]
+    fn render_empty_template_yields_empty_output() {
+        let out = render("", &Value::Null).unwrap();
+        assert_eq!(out, "");
+    }
 }

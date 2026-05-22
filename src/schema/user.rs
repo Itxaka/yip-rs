@@ -77,6 +77,7 @@ fn is_false(b: &bool) -> bool {
 mod tests {
     use super::*;
     use indoc::indoc;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn parses_full_user() {
@@ -136,5 +137,109 @@ mod tests {
         let s = serde_yaml::to_string(&u).unwrap();
         let back: User = serde_yaml::from_str(&s).unwrap();
         assert_eq!(back, u);
+    }
+
+    #[test]
+    fn minimal_yaml_name_only() {
+        let u: User = serde_yaml::from_str("name: bob\n").unwrap();
+        assert_eq!(u.name, "bob");
+        assert!(u.password_hash.is_empty());
+        assert!(u.groups.is_empty());
+        assert!(u.ssh_authorized_keys.is_empty());
+        assert!(!u.lock_passwd);
+        assert!(!u.system);
+    }
+
+    #[test]
+    fn empty_groups_list_round_trips_as_default() {
+        // Edge case: explicitly empty list should serialise as a default
+        // (Vec::is_empty causes the key to be omitted).
+        let u = User {
+            name: "u".into(),
+            groups: Vec::new(),
+            ssh_authorized_keys: Vec::new(),
+            ..Default::default()
+        };
+        let s = serde_yaml::to_string(&u).unwrap();
+        assert!(!s.contains("groups"));
+        assert!(!s.contains("ssh_authorized_keys"));
+        let back: User = serde_yaml::from_str(&s).unwrap();
+        assert_eq!(back, u);
+    }
+
+    #[test]
+    fn yaml_aliases_match_go_tags() {
+        // Verify YAML key spelling matches Go yaml tags: passwd, no_create_home,
+        // primary_group, no_user_group, no_log_init, lock_passwd,
+        // ssh_authorized_keys.
+        let y = indoc! {r#"
+            name: u
+            passwd: HASH
+            no_create_home: true
+            primary_group: admin
+            no_user_group: true
+            no_log_init: true
+            lock_passwd: true
+            ssh_authorized_keys: [k1]
+        "#};
+        let u: User = serde_yaml::from_str(y).unwrap();
+        assert_eq!(u.password_hash, "HASH");
+        assert!(u.no_create_home);
+        assert_eq!(u.primary_group, "admin");
+        assert!(u.no_user_group);
+        assert!(u.no_log_init);
+        assert!(u.lock_passwd);
+        assert_eq!(u.ssh_authorized_keys, vec!["k1"]);
+    }
+
+    #[test]
+    fn maximal_user_roundtrip() {
+        let u = User {
+            name: "alice".into(),
+            password_hash: "$6$abc".into(),
+            ssh_authorized_keys: vec!["ssh-ed25519 AAAA".into(), "ssh-rsa BBBB".into()],
+            gecos: "Alice".into(),
+            homedir: "/home/alice".into(),
+            no_create_home: true,
+            primary_group: "alice".into(),
+            groups: vec!["wheel".into(), "docker".into()],
+            no_user_group: true,
+            system: true,
+            no_log_init: true,
+            shell: "/bin/zsh".into(),
+            lock_passwd: true,
+            uid: "2000".into(),
+        };
+        let s = serde_yaml::to_string(&u).unwrap();
+        let back: User = serde_yaml::from_str(&s).unwrap();
+        assert_eq!(back, u);
+    }
+
+    #[test]
+    fn empty_user_yaml_omits_everything() {
+        let s = serde_yaml::to_string(&User::default()).unwrap();
+        // Default user must serialise to an empty mapping / nothing recognisable.
+        assert!(!s.contains("passwd"));
+        assert!(!s.contains("groups"));
+        assert!(!s.contains("ssh_authorized_keys"));
+        assert!(!s.contains("uid"));
+        assert!(!s.contains("lock_passwd"));
+    }
+
+    #[test]
+    fn yip_entity_default_for_empty_yaml() {
+        let e: YipEntity = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(e, YipEntity::default());
+    }
+
+    #[test]
+    fn yip_entity_roundtrip() {
+        let e = YipEntity {
+            path: "/etc/passwd".into(),
+            entity: "kind: user\nname: foo\n".into(),
+        };
+        let s = serde_yaml::to_string(&e).unwrap();
+        let back: YipEntity = serde_yaml::from_str(&s).unwrap();
+        assert_eq!(back, e);
     }
 }

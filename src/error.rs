@@ -214,3 +214,102 @@ impl From<&str> for Error {
 /// assert!(err_path().is_err());
 /// ```
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn io_at_preserves_path() {
+        let e = Error::io_at(
+            "/etc/passwd",
+            io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
+        );
+        match e {
+            Error::Io { path: Some(p), source } => {
+                assert_eq!(p, PathBuf::from("/etc/passwd"));
+                assert_eq!(source.kind(), io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("expected Error::Io with path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_display_includes_child_count() {
+        let multi = Error::Multi(vec![
+            Error::other("first"),
+            Error::other("second"),
+            Error::other("third"),
+        ]);
+        let s = multi.to_string();
+        // Display format embeds the count.
+        assert!(s.contains("3"), "Multi display should mention count, got {s:?}");
+
+        // And iterating the inner vector exposes every child's Display.
+        if let Error::Multi(children) = multi {
+            let rendered: Vec<String> = children.iter().map(|e| e.to_string()).collect();
+            assert_eq!(rendered, vec!["first", "second", "third"]);
+        } else {
+            unreachable!();
+        }
+    }
+
+    #[test]
+    fn plugin_display_includes_plugin_name_and_source() {
+        let inner = Error::other("inner-cause");
+        let wrapped = Error::Plugin {
+            plugin: "files".into(),
+            source: Box::new(inner),
+        };
+        let s = wrapped.to_string();
+        assert!(s.contains("files"), "expected plugin name in Display, got {s:?}");
+        assert!(s.contains("inner-cause"), "expected source message in Display, got {s:?}");
+    }
+
+    #[test]
+    fn cmd_display_includes_status_stderr_and_stdout_via_debug() {
+        let e = Error::Cmd {
+            cmd: "do-thing".into(),
+            status: Some(42),
+            stderr: "boom-on-stderr".into(),
+            stdout: "ignored-stdout".into(),
+        };
+        let s = e.to_string();
+        // Display contract from thiserror attribute: cmd, status, stderr.
+        assert!(s.contains("do-thing"));
+        assert!(s.contains("42"));
+        assert!(s.contains("boom-on-stderr"));
+        // stdout is preserved on the struct even though Display doesn't print it —
+        // verify via Debug so a future Display rewrite that drops the field is caught.
+        let dbg = format!("{e:?}");
+        assert!(dbg.contains("ignored-stdout"));
+    }
+
+    #[test]
+    fn from_impls_route_correctly() {
+        // io::Error -> Error::Io
+        let io_err: io::Error = io::Error::new(io::ErrorKind::NotFound, "missing");
+        let e: Error = io_err.into();
+        assert!(matches!(e, Error::Io { path: None, .. }));
+
+        // serde_yaml::Error -> Error::Yaml. Build one by parsing garbage.
+        let yaml_err = serde_yaml::from_str::<serde_yaml::Value>("foo: : :").unwrap_err();
+        let e: Error = yaml_err.into();
+        assert!(matches!(e, Error::Yaml(_)));
+
+        // &str -> Error::Other
+        let e: Error = "free-form".into();
+        match e {
+            Error::Other(s) => assert_eq!(s, "free-form"),
+            other => panic!("expected Other, got {other:?}"),
+        }
+
+        // String -> Error::Other (extra sanity)
+        let e: Error = String::from("owned-msg").into();
+        match e {
+            Error::Other(s) => assert_eq!(s, "owned-msg"),
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+}

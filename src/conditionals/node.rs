@@ -157,12 +157,17 @@ mod tests {
 
     // --- Additional tests ported from Go behaviour expectations ---
 
+    /// Serialize HOSTNAME env-var mutation across the whole node-test module so
+    /// parallel test execution doesn't race on the shared process env.
+    static HOSTNAME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Override the HOSTNAME env var for the scope of a closure so we can
     /// drive the regex matcher with a deterministic hostname. The test path
     /// in `current_hostname()` checks this env var before falling back to
     /// `gethostname`, so we exercise the same code path as a real host with
     /// the given hostname.
     fn with_env_hostname<R>(name: &str, f: impl FnOnce() -> R) -> R {
+        let _g = HOSTNAME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev = std::env::var("HOSTNAME").ok();
         std::env::set_var("HOSTNAME", name);
         let out = f();

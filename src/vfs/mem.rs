@@ -388,4 +388,113 @@ mod tests {
         let vfs = MemVfs::new();
         trait_roundtrip(&vfs, Path::new("/"));
     }
+
+    // ---- edge cases ----
+
+    #[test]
+    fn binary_data_with_nulls_and_non_utf8() {
+        let vfs = MemVfs::new();
+        let payload: Vec<u8> = vec![0x00, 0xFF, 0x00, 0xFE, 0x7F, 0x80, 0x00];
+        vfs.write(Path::new("/bin"), &payload).unwrap();
+        assert_eq!(vfs.read(Path::new("/bin")).unwrap(), payload);
+        // read_to_string surfaces non-UTF-8 as Error::Other (see Vfs default impl).
+        let err = vfs.read_to_string(Path::new("/bin")).unwrap_err();
+        assert!(matches!(err, Error::Other(_)));
+    }
+
+    #[test]
+    fn read_dir_empty_vs_hundred_entries() {
+        let vfs = MemVfs::new();
+        vfs.mkdir_all(Path::new("/empty")).unwrap();
+        assert_eq!(vfs.read_dir(Path::new("/empty")).unwrap().len(), 0);
+
+        for i in 0..100 {
+            vfs.write(Path::new(&format!("/big/f{i:03}")), b"x").unwrap();
+        }
+        let entries = vfs.read_dir(Path::new("/big")).unwrap();
+        assert_eq!(entries.len(), 100);
+        // MemVfs::read_dir sorts internally — verify order is stable + alphabetical.
+        let names: Vec<String> = entries
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names[0], "f000");
+        assert_eq!(names[99], "f099");
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+    }
+
+    #[test]
+    fn walk_with_dangling_symlink_does_not_include_it() {
+        // MemVfs::walk only returns files, so a dangling symlink that
+        // points to nothing must not appear in walk output.
+        let vfs = MemVfs::new();
+        vfs.mkdir_all(Path::new("/d")).unwrap();
+        vfs.symlink(Path::new("/missing"), Path::new("/d/link")).unwrap();
+        let files = vfs.walk(Path::new("/d")).unwrap();
+        assert!(files.is_empty());
+        // Reading via the dangling symlink fails (resolved target doesn't exist).
+        assert!(vfs.read(Path::new("/d/link")).is_err());
+    }
+
+    #[test]
+    fn mkdir_all_succeeds_even_when_component_is_file() {
+        // MemVfs is deliberately permissive — separate file/dir maps mean
+        // a path can be both. Document the behaviour so callers don't get
+        // surprised when porting from RealVfs.
+        let vfs = MemVfs::new();
+        vfs.write(Path::new("/blocker"), b"x").unwrap();
+        vfs.mkdir_all(Path::new("/blocker/child")).unwrap();
+        // Both the original file and the new dir exist.
+        assert!(vfs.metadata(Path::new("/blocker")).unwrap().is_file);
+        assert!(vfs.metadata(Path::new("/blocker/child")).unwrap().is_dir);
+    }
+
+    #[test]
+    fn chmod_on_missing_path_errors() {
+        let vfs = MemVfs::new();
+        let err = vfs.chmod(Path::new("/nope"), 0o600).unwrap_err();
+        assert!(matches!(err, Error::Io { .. }));
+    }
+
+    #[test]
+    fn chown_neg_one_neg_one_is_noop_on_existing() {
+        let vfs = MemVfs::new();
+        vfs.write(Path::new("/f"), b"x").unwrap();
+        // Establish a baseline owner.
+        vfs.chown(Path::new("/f"), 7, 8).unwrap();
+        // (-1, -1) keeps both.
+        vfs.chown(Path::new("/f"), -1, -1).unwrap();
+        let m = vfs.metadata(Path::new("/f")).unwrap();
+        assert_eq!((m.uid, m.gid), (7, 8));
+    }
+
+    #[test]
+    fn remove_all_missing_is_idempotent() {
+        let vfs = MemVfs::new();
+        vfs.remove_all(Path::new("/never")).unwrap();
+        vfs.remove_all(Path::new("/never")).unwrap();
+    }
+
+    #[test]
+    fn write_overwrites_existing_with_truncation() {
+        let vfs = MemVfs::new();
+        vfs.write(Path::new("/ow"), b"longer original content").unwrap();
+        vfs.write(Path::new("/ow"), b"hi").unwrap();
+        assert_eq!(vfs.read(Path::new("/ow")).unwrap(), b"hi");
+        assert_eq!(vfs.metadata(Path::new("/ow")).unwrap().size, 2);
+    }
+
+    #[test]
+    fn symlink_loop_walk_terminates() {
+        // a -> b, b -> a. MemVfs::walk only iterates files (not symlinks),
+        // so it cannot loop — just confirm it returns quickly with no files.
+        let vfs = MemVfs::new();
+        vfs.mkdir_all(Path::new("/loop")).unwrap();
+        vfs.symlink(Path::new("/loop/b"), Path::new("/loop/a")).unwrap();
+        vfs.symlink(Path::new("/loop/a"), Path::new("/loop/b")).unwrap();
+        let files = vfs.walk(Path::new("/loop")).unwrap();
+        assert!(files.is_empty());
+    }
 }

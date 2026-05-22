@@ -387,12 +387,10 @@ impl DefaultExecutor {
     /// Apply modifier (if any) + template render + YAML parse.
     fn parse_bytes(&self, bytes: &[u8]) -> Result<Config> {
         // Templating preprocess: inject system facts (OS, hostname, UUID).
-        // The template module may be a stub during early waves; if so it
-        // should be a pass-through. Errors propagate.
-        // TODO(wave-5): once `crate::template::render_with_sysdata` lands,
-        // switch to it for the richer funcmap.
-        #[allow(unused_mut)]
-        let mut rendered = render_template(bytes)?;
+        // Errors are swallowed (warn + fall back to raw) to match Go's
+        // `templateSysData`, which discards `TemplatedString` failures and
+        // continues with the original bytes.
+        let mut rendered = render_template(bytes);
 
         // Apply user modifier (e.g. dot_notation_modifier) AFTER template
         // render, matching the order in Go schema.Load: template first
@@ -675,13 +673,29 @@ fn fetch_url(url: &str) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
-/// Template-render a raw config blob. Wave-5 fills in the real impl; for
-/// now this is a pass-through so we don't block on it.
-fn render_template(bytes: &[u8]) -> Result<Vec<u8>> {
-    // Once `crate::template::render_with_sysdata` exists, replace this body
-    // with a call to it. The signature should be:
-    //   pub fn render_with_sysdata(bytes: &[u8]) -> Result<Vec<u8>>;
-    Ok(bytes.to_vec())
+/// Template-render a raw config blob through `crate::template::render_with_sysdata`.
+///
+/// Failure modes match Go's `templateSysData`: any error (invalid UTF-8,
+/// bad template syntax, sysdata gather failure) is logged as a warning and
+/// the original raw bytes are returned unchanged. Callers must not treat
+/// templating failure as a hard error — the upstream Go implementation
+/// swallows these silently.
+fn render_template(bytes: &[u8]) -> Vec<u8> {
+    let template_str = match std::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "config bytes are not valid UTF-8, skipping template render");
+            return bytes.to_vec();
+        }
+    };
+
+    match crate::template::render_with_sysdata(template_str) {
+        Ok(rendered) => rendered.into_bytes(),
+        Err(e) => {
+            warn!(error = %e, "template render failed, falling back to raw bytes");
+            bytes.to_vec()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1736,6 +1750,116 @@ stages:
         exec.apply("rootfs", &c, &RealVfs::new(), &NullConsole).unwrap();
         let l = log.lock().unwrap();
         assert_eq!(*l, vec!["p:my.dotted.stage".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Templating preprocess tests (sprig / `{{ .Values.System.* }}`).
+    // -----------------------------------------------------------------------
+
+    /// Captures stage.commands so a test can assert on the rendered text.
+    fn capturing_plugin(log: Arc<Mutex<Vec<String>>>) -> Plugin {
+        Arc::new(move |stage: &Stage, _fs, _con| {
+            for cmd in &stage.commands {
+                log.lock().unwrap().push(cmd.clone());
+            }
+            Ok(())
+        })
+    }
+
+    /// A `{{ .Values.System.OS.Name }}` reference in a command string is
+    /// substituted before the modifier runs and before YAML parsing. The
+    /// rendered value comes from `gather_sysdata()` and is non-empty on any
+    /// reasonable Linux test host, but at minimum the placeholder itself
+    /// must NOT survive into the parsed Stage.
+    #[test]
+    fn template_renders_values_system_os_name() {
+        let yaml = r#"
+stages:
+  rootfs:
+    - name: t
+      commands:
+        - "echo {{ .Values.System.OS.Name }}"
+"#;
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let exec =
+            DefaultExecutor::empty().with_plugin("cap", capturing_plugin(log.clone()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("c.yaml");
+        fs::write(&f, yaml).unwrap();
+        exec.run("rootfs", &RealVfs::new(), &NullConsole, &[f.display().to_string()])
+            .unwrap();
+
+        let l = log.lock().unwrap();
+        assert_eq!(l.len(), 1, "expected exactly one captured command: {l:?}");
+        let cmd = &l[0];
+        assert!(
+            !cmd.contains("{{"),
+            "template placeholder leaked through: {cmd:?}"
+        );
+        assert!(
+            cmd.starts_with("echo "),
+            "command prefix lost during render: {cmd:?}"
+        );
+    }
+
+    /// Bad template syntax must not abort parsing. The original (un-rendered)
+    /// bytes are passed through to YAML, so the stage parses fine and the
+    /// `{{` literal survives into the command.
+    #[test]
+    fn template_bad_syntax_falls_back_to_raw() {
+        // `{{ if }}` with no matching `{{ end }}` is a tera/Go parse error.
+        let yaml = r#"
+stages:
+  rootfs:
+    - name: t
+      commands:
+        - "literal {{ if .x }}unterminated"
+"#;
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let exec =
+            DefaultExecutor::empty().with_plugin("cap", capturing_plugin(log.clone()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("c.yaml");
+        fs::write(&f, yaml).unwrap();
+        // Run must succeed — bad templates are swallowed (Go parity).
+        exec.run("rootfs", &RealVfs::new(), &NullConsole, &[f.display().to_string()])
+            .unwrap();
+
+        let l = log.lock().unwrap();
+        assert_eq!(l.len(), 1, "expected fallback-parsed command: {l:?}");
+        // Raw bytes were fed to YAML, so the `{{` literal is preserved.
+        assert!(
+            l[0].contains("{{ if .x }}"),
+            "raw template text should survive fallback: {:?}",
+            l[0]
+        );
+    }
+
+    /// A config without any `{{ ... }}` segments passes through templating
+    /// unchanged — render is effectively a no-op for plain YAML.
+    #[test]
+    fn template_passthrough_for_plain_yaml() {
+        let yaml = r#"
+stages:
+  rootfs:
+    - name: plain
+      commands:
+        - "echo no templating here"
+"#;
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let exec =
+            DefaultExecutor::empty().with_plugin("cap", capturing_plugin(log.clone()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("c.yaml");
+        fs::write(&f, yaml).unwrap();
+        exec.run("rootfs", &RealVfs::new(), &NullConsole, &[f.display().to_string()])
+            .unwrap();
+
+        let l = log.lock().unwrap();
+        assert_eq!(*l, vec!["echo no templating here".to_string()]);
     }
 
     /// Build a stage with both `commands` and `files` populated for the

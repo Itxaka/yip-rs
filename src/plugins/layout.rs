@@ -2696,4 +2696,1019 @@ mod tests {
             rest.end_mib,
         );
     }
+
+    // ---------------------------------------------------------------------
+    // Direct ports of every Ginkgo `It` block from yip's
+    // `pkg/plugins/script_device_test.go` (7 cases). In Go, `script_device`
+    // is its own file exposing a top-level `ResolveScriptDevice` function;
+    // in the Rust port that logic lives inside the layout plugin (the only
+    // production caller) as `ConsoleLayoutOps::resolve_script_device`. The
+    // Rust impl shells out via `console.run(cmd_str)` rather than calling
+    // `exec.Command` itself, so "missing-file" and "non-zero-exit" tests
+    // simulate the underlying failure with `RecordingConsole::expect(..,
+    // Err(..))`. Each test also asserts the exact command string the
+    // console received — that's how "arg passing" is checked here (the
+    // remainder of the `script://` URI is forwarded verbatim).
+    // ---------------------------------------------------------------------
+
+    /// Port of Go It: "returns a plain path unchanged". No `script://`
+    /// prefix → passthrough, no commands recorded.
+    #[test]
+    fn go_port_script_device_plain_path_unchanged() {
+        let console = RecordingConsole::new();
+        let ops = ConsoleLayoutOps::new(&console);
+        let result = ops.resolve_script_device("/dev/sda").expect("ok");
+        assert_eq!(result, "/dev/sda");
+        assert!(
+            console.commands().is_empty(),
+            "no command should be run for a plain path"
+        );
+    }
+
+    /// Port of Go It: "executes the script and returns the trimmed stdout
+    /// as the device path". `script:///tmp/pick-disk.sh` → console.run is
+    /// called with the path (no `script://` prefix), stdout is trimmed and
+    /// returned. The recorded command is asserted to match the script
+    /// portion exactly.
+    #[test]
+    fn go_port_script_device_executes_and_returns_trimmed_stdout() {
+        let console = RecordingConsole::new();
+        console.expect("/tmp/pick-disk.sh", Ok("/dev/sda\n".to_string()));
+        let ops = ConsoleLayoutOps::new(&console);
+        let result = ops
+            .resolve_script_device("script:///tmp/pick-disk.sh")
+            .expect("ok");
+        assert_eq!(result, "/dev/sda");
+        assert_eq!(console.commands(), vec!["/tmp/pick-disk.sh".to_string()]);
+    }
+
+    /// Port of Go It: "trims leading and trailing whitespace from stdout".
+    /// Script emits `"  /dev/vda  "` (no trailing newline either) →
+    /// result is the inner `/dev/vda`.
+    #[test]
+    fn go_port_script_device_trims_whitespace() {
+        let console = RecordingConsole::new();
+        console.expect("/tmp/pick-disk.sh", Ok("  /dev/vda  ".to_string()));
+        let ops = ConsoleLayoutOps::new(&console);
+        let result = ops
+            .resolve_script_device("script:///tmp/pick-disk.sh")
+            .expect("ok");
+        assert_eq!(result, "/dev/vda");
+    }
+
+    /// Port of Go It: "returns an error when the script exits with a
+    /// non-zero code". Simulated by installing an `Err` response on the
+    /// console. The bubbled-up error must mention the stderr text so a
+    /// `something went wrong` substring check passes (matches the Go
+    /// assertion).
+    #[test]
+    fn go_port_script_device_non_zero_exit_errors() {
+        let console = RecordingConsole::new();
+        console.expect(
+            "/tmp/fail.sh",
+            Err("something went wrong".to_string()),
+        );
+        let ops = ConsoleLayoutOps::new(&console);
+        let err = ops
+            .resolve_script_device("script:///tmp/fail.sh")
+            .expect_err("non-zero exit must surface");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("something went wrong"),
+            "expected stderr in error message, got: {msg}"
+        );
+        // The script was attempted exactly once.
+        assert_eq!(console.commands(), vec!["/tmp/fail.sh".to_string()]);
+    }
+
+    /// Port of Go It: "returns an error when the script produces no
+    /// output". Empty (or whitespace-only) stdout from a successful exit
+    /// is still treated as a failure to resolve a device.
+    #[test]
+    fn go_port_script_device_empty_output_errors() {
+        let console = RecordingConsole::new();
+        console.expect("/tmp/empty.sh", Ok(String::new()));
+        let ops = ConsoleLayoutOps::new(&console);
+        let err = ops
+            .resolve_script_device("script:///tmp/empty.sh")
+            .expect_err("empty output must surface");
+        let msg = format!("{err}");
+        assert!(
+            msg.to_lowercase().contains("empty"),
+            "expected 'empty' in error message, got: {msg}"
+        );
+    }
+
+    /// Port of Go It: "returns an error when the script path does not
+    /// exist". In the Rust impl `console.run` is what would fail; we
+    /// simulate that by installing an Err response keyed on the missing
+    /// path. The error must surface — exactly what `ConsoleLayoutOps`
+    /// does is propagate the underlying `Error::Cmd`.
+    #[test]
+    fn go_port_script_device_missing_file_errors() {
+        let console = RecordingConsole::new();
+        console.expect(
+            "/nonexistent/pick-disk.sh",
+            Err("No such file or directory".to_string()),
+        );
+        let ops = ConsoleLayoutOps::new(&console);
+        let err = ops
+            .resolve_script_device("script:///nonexistent/pick-disk.sh")
+            .expect_err("missing script must surface as error");
+        // The underlying Err is wrapped by RecordingConsole as Error::Cmd
+        // with our stderr text; just assert the error printed mentions it.
+        let msg = format!("{err}");
+        assert!(
+            msg.to_lowercase().contains("no such file")
+                || msg.contains("/nonexistent/pick-disk.sh"),
+            "expected missing-file hint in error message, got: {msg}"
+        );
+        assert_eq!(
+            console.commands(),
+            vec!["/nonexistent/pick-disk.sh".to_string()]
+        );
+    }
+
+    /// Port of Go It: "passes arguments to the script". In Go,
+    /// `exec.Command` splits the post-`script://` string on whitespace
+    /// and passes everything after the program name as argv. In the Rust
+    /// port the whole substring is handed to `console.run` verbatim
+    /// (the shell will do the splitting). Either way the contract is
+    /// "the trailing arguments reach the script unmodified": we assert
+    /// the recorded command string equals the full `path arg` sequence.
+    #[test]
+    fn go_port_script_device_passes_arguments() {
+        let console = RecordingConsole::new();
+        // The script is expected to be invoked with its argument
+        // appended; the canned response echoes the arg.
+        console.expect(
+            "/tmp/with-args.sh /dev/nvme0n1",
+            Ok("/dev/nvme0n1\n".to_string()),
+        );
+        let ops = ConsoleLayoutOps::new(&console);
+        let result = ops
+            .resolve_script_device("script:///tmp/with-args.sh /dev/nvme0n1")
+            .expect("ok");
+        assert_eq!(result, "/dev/nvme0n1");
+        // Crucially: the argument is part of the command string passed
+        // to the console. If the plugin ever stops forwarding args, the
+        // recorded command would change and this assertion would fail.
+        assert_eq!(
+            console.commands(),
+            vec!["/tmp/with-args.sh /dev/nvme0n1".to_string()]
+        );
+    }
+
+    // =================================================================
+    // Ports of pkg/plugins/layout_test.go (Go yip) `It(...)` blocks.
+    //
+    // Strategy:
+    //   * Tests that only assert command shape / error propagation use
+    //     MockOps (Go mocks mkfs the same way).
+    //   * Tests that assert real partition-table state use the
+    //     `disk-builtin` feature gate + the production `GptLayoutOps`
+    //     against a sparse disk file via `make_sparse_disk`. With a
+    //     mocked-out mkfs (MockOps) the table doesn't actually mutate,
+    //     so for those cases we delegate directly to GptLayoutOps.
+    //   * Tests whose Go assertion exercises parted/sfdisk's own
+    //     internal validation (e.g. "parted refuses to shrink") can't
+    //     be reproduced in a unit test without a real parted on PATH;
+    //     those are documented with `#[ignore]` + TODO.
+    //
+    // The script:// resolution scenarios (3 cases in the Go file) are
+    // intentionally not re-ported here — they're already covered by
+    // the `go_port_script_device_*` tests immediately above (which port
+    // Go's standalone `script_device_test.go`). They test the same
+    // resolve_script_device code path the layout_test.go script:// It
+    // blocks exercise via Layout(...).
+    // -----------------------------------------------------------------
+
+    /// Like MockOps but `add_partition` appends to its `existing` list,
+    /// so a follow-up `run_with` call against the same MockOps sees the
+    /// partition as already-present (idempotency).
+    struct StatefulMockOps {
+        console: RecordingConsole,
+        existing: std::cell::RefCell<Vec<ExistingPartition>>,
+    }
+
+    impl StatefulMockOps {
+        fn new() -> Self {
+            Self {
+                console: RecordingConsole::new(),
+                existing: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl LayoutOps for StatefulMockOps {
+        fn resolve_script_device(&self, raw: &str) -> Result<String> {
+            if !raw.starts_with(SCRIPT_SCHEME) {
+                return Ok(raw.to_string());
+            }
+            Ok(raw.trim_start_matches(SCRIPT_SCHEME).to_string())
+        }
+        fn init_disk_gpt(&self, device: &str, _disk_name: &str) -> Result<()> {
+            self.console
+                .run(&format!("parted -s {device} mklabel gpt"))
+                .map(|_| ())
+        }
+        fn resolve_label_to_disk(&self, label: &str) -> Result<String> {
+            self.console.run(&format!("blkid -L {label}"))?;
+            Ok(format!("/dev/by-label/{label}"))
+        }
+        fn verify_and_repair_headers(&self, device: &str) -> Result<()> {
+            self.console.run(&format!("sgdisk -e {device}")).map(|_| ())
+        }
+        fn read_partitions(&self, _device: &str) -> Result<Vec<ExistingPartition>> {
+            Ok(self.existing.borrow().clone())
+        }
+        fn add_partition(&self, device: &str, plan: &PartitionPlan) -> Result<()> {
+            // record the parted mkpart shell-out (so command-shape
+            // assertions still work) ...
+            let name = if plan.p_label.is_empty() {
+                "primary".to_string()
+            } else {
+                plan.p_label.clone()
+            };
+            self.console
+                .run(&format!(
+                    "parted -s {} mkpart {} {} {}MiB {}MiB",
+                    device,
+                    name,
+                    parted_fs(&plan.file_system),
+                    plan.start_mib,
+                    plan.end_mib,
+                ))
+                .map(|_| ())?;
+            // ... and ALSO mutate the in-memory partition table.
+            self.existing.borrow_mut().push(ExistingPartition {
+                number: plan.number,
+                p_label: plan.p_label.clone(),
+                fs_label: plan.fs_label.clone(),
+                start_mib: plan.start_mib,
+                end_mib: plan.end_mib,
+            });
+            Ok(())
+        }
+        fn settle(&self, _device: &str) -> Result<()> {
+            self.console
+                .run("udevadm trigger && udevadm settle")
+                .map(|_| ())
+        }
+        fn mkfs(&self, device: &str, plan: &PartitionPlan) -> Result<()> {
+            let tool = mkfs_tool(&plan.file_system);
+            let part_dev = partition_device_path(device, plan.number);
+            let mut cmd = String::from(tool);
+            if !plan.fs_label.is_empty() {
+                match plan.file_system.as_str() {
+                    "vfat" | "fat" | "fat16" | "fat32" => {
+                        cmd.push_str(" -n ");
+                        cmd.push_str(&plan.fs_label);
+                    }
+                    _ => {
+                        cmd.push_str(" -L ");
+                        cmd.push_str(&plan.fs_label);
+                    }
+                }
+            }
+            cmd.push(' ');
+            cmd.push_str(&part_dev);
+            self.console.run(&cmd).map(|_| ())
+        }
+        fn expand_last_partition(&self, device: &str, target_mib: u64) -> Result<()> {
+            let last = self
+                .existing
+                .borrow()
+                .last()
+                .cloned()
+                .ok_or_else(|| Error::other("no partition to expand"))?;
+            // Mirror ConsoleLayoutOps's swap-is-not-resizable error path
+            // so the swap-expand test can assert on the same message.
+            // We don't carry fs metadata in ExistingPartition, so we
+            // inspect the recorded mkfs commands for "mkswap" on this
+            // partition number.
+            let part_dev = partition_device_path(device, last.number);
+            if self
+                .console
+                .commands()
+                .iter()
+                .any(|c| c.starts_with("mkswap") && c.ends_with(&part_dev))
+            {
+                return Err(Error::other("swap resizing is not supported"));
+            }
+            let end = if target_mib == 0 {
+                "100%".to_string()
+            } else {
+                format!("{target_mib}MiB")
+            };
+            self.console
+                .run(&format!(
+                    "parted -s {} resizepart {} {}",
+                    device, last.number, end
+                ))?;
+            // Track new end_mib so chained Expand-after-create works.
+            if target_mib > 0 {
+                if let Some(last) = self.existing.borrow_mut().last_mut() {
+                    last.end_mib = target_mib;
+                }
+            }
+            self.console
+                .run(&format!("resize2fs {part_dev}"))
+                .map(|_| ())
+        }
+    }
+
+    /// Go: `Fails to find device by path`.
+    ///
+    /// In Rust the failure surfaces through `GptLayoutOps::add_partition`,
+    /// which tries to `open(2)` the device. We use the production ops
+    /// against a path that does not exist on disk.
+    #[cfg(feature = "disk-builtin")]
+    #[test]
+    fn go_layout_fails_to_find_device_by_path() {
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        let ops = GptLayoutOps::new(&console);
+        let stage = Stage {
+            layout: Layout {
+                device: Some(Device {
+                    path: "/not/existing/device".into(),
+                    ..Default::default()
+                }),
+                parts: vec![SchemaPartition {
+                    p_label: "FAKELABEL".into(),
+                    size: 100,
+                    file_system: "ext4".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = run_with(&stage, &fs, &ops).expect_err("missing device must fail");
+        let _ = format!("{err}"); // any error is acceptable
+    }
+
+    /// Go: `Fails to find device by label`.
+    ///
+    /// The Rust `resolve_label_to_disk` runs `blkid -L <label>`; an
+    /// empty result errors with "could not resolve device for label".
+    #[cfg(feature = "disk-builtin")]
+    #[test]
+    fn go_layout_fails_to_find_device_by_label() {
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        // RecordingConsole's default response for an unmatched command
+        // is Ok("") — exactly what an unknown label produces from blkid.
+        let ops = GptLayoutOps::new(&console);
+        let stage = Stage {
+            layout: Layout {
+                device: Some(Device {
+                    label: "WEIRDLABELIHOPEITDOESNTEXISTS".into(),
+                    ..Default::default()
+                }),
+                parts: vec![SchemaPartition {
+                    p_label: "FAKELABEL".into(),
+                    size: 100,
+                    file_system: "ext4".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = run_with(&stage, &fs, &ops).expect_err("unknown label must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("could not resolve") || msg.to_lowercase().contains("label"),
+            "expected label-resolution error, got: {msg}",
+        );
+    }
+
+    /// Go: `Adds a new partition by path`.
+    ///
+    /// Verifies the partition shows up in the table with the expected
+    /// pLabel and roughly-100 MiB size. Uses GptLayoutOps against a
+    /// sparse disk so the table really changes.
+    #[cfg(feature = "disk-builtin")]
+    #[test]
+    fn go_layout_adds_a_new_partition_by_path() {
+        let (_tmp, path) = make_sparse_disk(200);
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        let ops = GptLayoutOps::new(&console);
+        ops.init_disk_gpt(&path, "").expect("init");
+        let stage = Stage {
+            layout: Layout {
+                device: Some(Device {
+                    path: path.clone(),
+                    ..Default::default()
+                }),
+                parts: vec![SchemaPartition {
+                    p_label: "FAKELABEL".into(),
+                    size: 100,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        run_with(&stage, &fs, &ops).expect("layout should succeed");
+        let parts = ops.read_partitions(&path).expect("read parts");
+        assert_eq!(parts.len(), 1, "expected one partition, got {parts:?}");
+        assert_eq!(parts[0].p_label, "FAKELABEL");
+        let span_mib = parts[0].end_mib - parts[0].start_mib + 1;
+        assert!(
+            (99..=101).contains(&span_mib),
+            "expected ~100 MiB partition span, got {span_mib} MiB",
+        );
+    }
+
+    /// Go: `Adds a new partition by path with fsLabel`.
+    ///
+    /// `FSLabel` must reach `mkfs.ext2` as `-L FSLABEL`. MockOps
+    /// records the exact mkfs command shape; the Go test only
+    /// asserted the same.
+    #[test]
+    fn go_layout_adds_a_new_partition_by_path_with_fs_label() {
+        let fs = vfs_with("/test.img");
+        let ops = MockOps::new();
+        let stage = Stage {
+            layout: Layout {
+                device: Some(Device {
+                    path: "/test.img".into(),
+                    ..Default::default()
+                }),
+                parts: vec![SchemaPartition {
+                    p_label: "FAKELABEL".into(),
+                    fs_label: "FSLABEL".into(),
+                    size: 100,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        run_with(&stage, &fs, &ops).expect("ok");
+        let cmds = ops.console.commands();
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("mkfs.ext2 -L FSLABEL /test.img1")),
+            "expected mkfs.ext2 -L FSLABEL ...1, got {cmds:?}",
+        );
+    }
+
+    /// Go: `Adds a new partition by label`.
+    ///
+    /// Label resolution via `blkid -L` runs first; subsequent ops
+    /// target the resolved device path.
+    #[test]
+    fn go_layout_adds_a_new_partition_by_label() {
+        let fs = MemVfs::new();
+        let ops = MockOps::new();
+        let stage = Stage {
+            layout: Layout {
+                device: Some(Device {
+                    label: "SOMELABEL".into(),
+                    ..Default::default()
+                }),
+                parts: vec![SchemaPartition {
+                    p_label: "PLABEL".into(),
+                    size: 100,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        run_with(&stage, &fs, &ops).expect("ok");
+        let cmds = ops.console.commands();
+        assert!(
+            cmds.iter().any(|c| c == "blkid -L SOMELABEL"),
+            "expected blkid call, got {cmds:?}",
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("mkpart") && c.contains("/dev/by-label/SOMELABEL")),
+            "expected mkpart on resolved device, got {cmds:?}",
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("mkfs.ext2")),
+            "expected mkfs.ext2 (default fs), got {cmds:?}",
+        );
+    }
+
+    /// Go: `Adds a new partition by label with fsLabel`.
+    #[test]
+    fn go_layout_adds_a_new_partition_by_label_with_fs_label() {
+        let fs = MemVfs::new();
+        let ops = MockOps::new();
+        let stage = Stage {
+            layout: Layout {
+                device: Some(Device {
+                    label: "SOMELABEL".into(),
+                    ..Default::default()
+                }),
+                parts: vec![SchemaPartition {
+                    fs_label: "MYLABEL".into(),
+                    size: 100,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        run_with(&stage, &fs, &ops).expect("ok");
+        let cmds = ops.console.commands();
+        assert!(
+            cmds.iter().any(|c| c.starts_with("blkid -L SOMELABEL")),
+            "expected blkid call, got {cmds:?}",
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("mkfs.ext2 -L MYLABEL /dev/by-label/SOMELABEL1")),
+            "expected mkfs.ext2 -L MYLABEL on resolved device, got {cmds:?}",
+        );
+    }
+
+    /// Go: `Fails to add a partition of 1025MiB, there are only
+    /// 1024MiB available`.
+    ///
+    /// GptLayoutOps's add_partition errors out when the requested
+    /// size exceeds the disk's free space; run_with bubbles that up
+    /// via Error::Multi.
+    #[cfg(feature = "disk-builtin")]
+    #[test]
+    fn go_layout_fails_to_add_partition_larger_than_disk() {
+        let (_tmp, path) = make_sparse_disk(1024); // 1 GiB sparse disk
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        let ops = GptLayoutOps::new(&console);
+        ops.init_disk_gpt(&path, "").expect("init");
+        let stage = Stage {
+            layout: Layout {
+                device: Some(Device {
+                    path: path.clone(),
+                    ..Default::default()
+                }),
+                parts: vec![SchemaPartition {
+                    fs_label: "FAKELABEL".into(),
+                    size: 1025,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = run_with(&stage, &fs, &ops).expect_err("oversize must fail");
+        let _ = format!("{err}");
+    }
+
+    /// Go: `Ignores an already existing partition`.
+    ///
+    /// First call creates the partition; second call (same input)
+    /// must be idempotent — no new mkpart. StatefulMockOps tracks
+    /// the partition between calls.
+    #[test]
+    fn go_layout_ignores_an_already_existing_partition() {
+        let fs = vfs_with("/test.img");
+        let ops = StatefulMockOps::new();
+        let stage = Stage {
+            layout: Layout {
+                device: Some(Device {
+                    path: "/test.img".into(),
+                    ..Default::default()
+                }),
+                parts: vec![SchemaPartition {
+                    p_label: "FAKELABEL".into(),
+                    size: 100,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        run_with(&stage, &fs, &ops).expect("first call ok");
+        let mkpart_first = ops
+            .console
+            .commands()
+            .iter()
+            .filter(|c| c.contains("mkpart"))
+            .count();
+        assert_eq!(mkpart_first, 1, "first call should mkpart once");
+
+        run_with(&stage, &fs, &ops).expect("second call ok");
+        let mkpart_total = ops
+            .console
+            .commands()
+            .iter()
+            .filter(|c| c.contains("mkpart"))
+            .count();
+        assert_eq!(mkpart_total, 1, "second call must NOT add another mkpart");
+        assert_eq!(ops.existing.borrow().len(), 1);
+    }
+
+    /// Go: `Fails to expand last partition, it can't shrink a
+    /// partition`.
+    ///
+    /// In Go this assertion is enforced by parted itself; the Rust
+    /// `expand_last_partition` forwards the target MiB to parted
+    /// verbatim and has no Rust-side shrink check. Without a real
+    /// parted on PATH we can't exercise this in a unit test.
+    #[test]
+    #[ignore = "TODO: Rust's expand_last_partition doesn't pre-validate \
+                shrink direction; the rejection comes from parted at \
+                runtime, which is not exercised in unit tests. Port \
+                once we add a Rust-side shrink check."]
+    fn go_layout_fails_to_expand_last_partition_shrink_rejected() {
+        // Intent: create a 512 MiB partition, then try to expand to
+        // 256 MiB, expect error.
+    }
+
+    /// Go: `Expands last partition`.
+    ///
+    /// Two-phase scenario: create 512 MiB then expand to 1024 MiB.
+    /// StatefulMockOps tracks the partition's end_mib across calls
+    /// so we can assert it grew.
+    #[test]
+    fn go_layout_expands_last_partition() {
+        let fs = vfs_with("/test.img");
+        let ops = StatefulMockOps::new();
+
+        let create_stage = Stage {
+            layout: Layout {
+                device: Some(Device {
+                    path: "/test.img".into(),
+                    ..Default::default()
+                }),
+                parts: vec![SchemaPartition {
+                    p_label: "FAKELABEL".into(),
+                    size: 512,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        run_with(&create_stage, &fs, &ops).expect("create ok");
+        assert_eq!(ops.existing.borrow().len(), 1);
+        // 1-MiB alignment → start=1, end=513 (size 512).
+        assert_eq!(ops.existing.borrow()[0].end_mib, 513);
+
+        let expand_stage = Stage {
+            layout: Layout {
+                device: Some(Device {
+                    path: "/test.img".into(),
+                    ..Default::default()
+                }),
+                expand: Some(ExpandPartition { size: 1024 }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        run_with(&expand_stage, &fs, &ops).expect("expand ok");
+        assert!(
+            ops.console
+                .commands()
+                .iter()
+                .any(|c| c == "parted -s /test.img resizepart 1 1024MiB"),
+            "expected resizepart 1 1024MiB, got {:?}",
+            ops.console.commands(),
+        );
+        assert_eq!(ops.existing.borrow()[0].end_mib, 1024);
+    }
+
+    /// Go: `Expands last partition to take all space`.
+    ///
+    /// `Expand{Size: 0}` → parted gets `100%`.
+    #[test]
+    fn go_layout_expands_last_partition_to_take_all_space() {
+        let fs = vfs_with("/test.img");
+        let ops = StatefulMockOps::new();
+
+        let create_stage = Stage {
+            layout: Layout {
+                device: Some(Device {
+                    path: "/test.img".into(),
+                    ..Default::default()
+                }),
+                parts: vec![SchemaPartition {
+                    p_label: "FAKELABEL".into(),
+                    size: 512,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        run_with(&create_stage, &fs, &ops).expect("create ok");
+
+        let expand_stage = Stage {
+            layout: Layout {
+                device: Some(Device {
+                    path: "/test.img".into(),
+                    ..Default::default()
+                }),
+                expand: Some(ExpandPartition { size: 0 }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        run_with(&expand_stage, &fs, &ops).expect("expand ok");
+        assert!(
+            ops.console
+                .commands()
+                .iter()
+                .any(|c| c == "parted -s /test.img resizepart 1 100%"),
+            "expected resizepart 1 100%, got {:?}",
+            ops.console.commands(),
+        );
+    }
+
+    /// Go: `Expands last partition after creating the partitions`.
+    ///
+    /// Single stage that BOTH creates a partition AND requests an
+    /// expand. run_with runs both in one shot.
+    #[test]
+    fn go_layout_expands_last_partition_in_same_stage_as_create() {
+        let fs = vfs_with("/test.img");
+        let ops = StatefulMockOps::new();
+        let stage = Stage {
+            layout: Layout {
+                device: Some(Device {
+                    path: "/test.img".into(),
+                    ..Default::default()
+                }),
+                parts: vec![SchemaPartition {
+                    p_label: "FAKELABEL".into(),
+                    size: 512,
+                    ..Default::default()
+                }],
+                expand: Some(ExpandPartition { size: 1024 }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        run_with(&stage, &fs, &ops).expect("ok");
+        let cmds = ops.console.commands();
+        assert!(
+            cmds.iter().any(|c| c.contains("mkpart")),
+            "expected mkpart in {cmds:?}",
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| c == "parted -s /test.img resizepart 1 1024MiB"),
+            "expected resizepart to 1024MiB, got {cmds:?}",
+        );
+        assert_eq!(ops.existing.borrow()[0].end_mib, 1024);
+    }
+
+    /// Go: `Expands last partition with XFS fs`.
+    ///
+    /// Single-stage create+expand on an xfs partition. We confirm
+    /// mkfs.xfs ran and resizepart fired with the requested MiB.
+    #[test]
+    fn go_layout_expands_last_partition_with_xfs_fs() {
+        let fs = vfs_with("/test.img");
+        let ops = StatefulMockOps::new();
+        let stage = Stage {
+            layout: Layout {
+                device: Some(Device {
+                    path: "/test.img".into(),
+                    ..Default::default()
+                }),
+                parts: vec![SchemaPartition {
+                    p_label: "FAKELABEL".into(),
+                    size: 100,
+                    file_system: "xfs".into(),
+                    ..Default::default()
+                }],
+                expand: Some(ExpandPartition { size: 1024 }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        run_with(&stage, &fs, &ops).expect("ok");
+        let cmds = ops.console.commands();
+        assert!(
+            cmds.iter().any(|c| c.starts_with("mkfs.xfs")),
+            "expected mkfs.xfs, got {cmds:?}",
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| c == "parted -s /test.img resizepart 1 1024MiB"),
+            "expected resizepart 1 1024MiB, got {cmds:?}",
+        );
+        assert_eq!(ops.existing.borrow()[0].end_mib, 1024);
+    }
+
+    /// Go: `Fails to expand last partition, if there is not enough
+    /// space left`.
+    ///
+    /// Rust's expand_last_partition forwards the MiB target to parted
+    /// verbatim and does not pre-validate against disk size; the
+    /// out-of-space error comes from parted at runtime.
+    #[test]
+    #[ignore = "TODO: Rust's expand_last_partition forwards the target \
+                to parted without a disk-capacity pre-check. The \
+                rejection comes from parted at runtime, not exercised \
+                in unit tests."]
+    fn go_layout_fails_to_expand_last_partition_not_enough_space() {
+        // Intent: create a 1000 MiB partition on a 1 GiB disk, then
+        // try to expand to 3073 MiB; expect error.
+    }
+
+    /// Go: `Fails on an xfs fs with a label longer than 12 chars`.
+    ///
+    /// (Same assertion as the existing `xfs_label_longer_than_12_chars_fails`
+    /// test, kept here for 1:1 traceability with the Go suite.)
+    #[test]
+    fn go_layout_fails_on_xfs_fs_with_label_longer_than_12_chars() {
+        let fs = vfs_with("/test.img");
+        let ops = MockOps::new();
+        let stage = Stage {
+            layout: Layout {
+                device: Some(Device {
+                    path: "/test.img".into(),
+                    ..Default::default()
+                }),
+                parts: vec![SchemaPartition {
+                    fs_label: "LABEL_TOO_LONG_FOR_XFS".into(),
+                    size: 1024,
+                    file_system: "xfs".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = run_with(&stage, &fs, &ops).unwrap_err();
+        assert!(
+            format!("{err}").contains("cannot be longer than 12 chars"),
+            "expected 12-char limit error, got {err}",
+        );
+    }
+
+    /// Go: `Works on an non-xfs fs with a label longer than 12 chars`.
+    ///
+    /// The 12-char limit is XFS-specific; ext4 accepts long labels.
+    #[test]
+    fn go_layout_works_on_non_xfs_fs_with_label_longer_than_12_chars() {
+        let fs = vfs_with("/test.img");
+        let ops = MockOps::new();
+        let stage = Stage {
+            layout: Layout {
+                device: Some(Device {
+                    path: "/test.img".into(),
+                    ..Default::default()
+                }),
+                parts: vec![SchemaPartition {
+                    p_label: "LABEL_TOO_LONG_FOR_XFS".into(),
+                    size: 10,
+                    file_system: "ext4".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        run_with(&stage, &fs, &ops).expect("ext4 long pLabel is fine");
+        assert!(
+            ops.console
+                .commands()
+                .iter()
+                .any(|c| c.contains("mkfs.ext4")),
+            "expected mkfs.ext4, got {:?}",
+            ops.console.commands(),
+        );
+    }
+
+    /// Go: `Adds a swap partition and fails expanding it`.
+    ///
+    /// Creating a swap partition succeeds (mkswap is the recorded
+    /// command); expanding it errors with
+    /// "swap resizing is not supported".
+    #[test]
+    fn go_layout_adds_swap_partition_and_fails_expanding_it() {
+        let fs = vfs_with("/test.img");
+        let ops = StatefulMockOps::new();
+        let stage = Stage {
+            layout: Layout {
+                device: Some(Device {
+                    path: "/test.img".into(),
+                    ..Default::default()
+                }),
+                parts: vec![SchemaPartition {
+                    fs_label: "MYLABEL".into(),
+                    size: 10,
+                    file_system: "swap".into(),
+                    ..Default::default()
+                }],
+                expand: Some(ExpandPartition { size: 500 }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = run_with(&stage, &fs, &ops).expect_err("expand-on-swap must fail");
+        // run_with collects expand errors into Error::Multi, whose
+        // Display only shows the count — inspect inner errors directly.
+        let messages: Vec<String> = match &err {
+            Error::Multi(children) => children.iter().map(|e| e.to_string()).collect(),
+            other => vec![other.to_string()],
+        };
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("swap resizing is not supported")),
+            "expected swap-resize error in {messages:?}",
+        );
+        assert!(
+            ops.console
+                .commands()
+                .iter()
+                .any(|c| c.starts_with("mkswap")),
+            "expected mkswap to run, got {:?}",
+            ops.console.commands(),
+        );
+    }
+
+    /// Go: `Resolves device path via script:// and adds a partition`.
+    ///
+    /// The full-pipeline (Layout) variant of the script:// case.
+    /// MockOps's `resolve_script_device` mapping returns the target
+    /// device; downstream ops must then see the resolved path, not
+    /// the script:// URL.
+    #[test]
+    fn go_layout_resolves_script_device_and_adds_partition() {
+        let fs = vfs_with("/test.img");
+        let ops = MockOps::new();
+        ops.set_script("script:///opt/pick-disk.sh", "/test.img");
+        let stage = Stage {
+            layout: Layout {
+                device: Some(Device {
+                    path: "script:///opt/pick-disk.sh".into(),
+                    ..Default::default()
+                }),
+                parts: vec![SchemaPartition {
+                    p_label: "FAKELABEL".into(),
+                    size: 100,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        run_with(&stage, &fs, &ops).expect("ok");
+        let cmds = ops.console.commands();
+        for c in &cmds {
+            assert!(!c.contains("script://"), "leaked script:// in {c:?}");
+        }
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("mkpart") && c.contains("/test.img")),
+            "expected mkpart on /test.img, got {cmds:?}",
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("FAKELABEL")),
+            "expected FAKELABEL in commands, got {cmds:?}",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // computeFreeSpace / CheckDiskFreeSpaceMiB block (Go top-level
+    // Describe block, 3 It blocks).
+    //
+    // The Rust port does not expose an equivalent `Disk` helper struct
+    // with `CheckDiskFreeSpaceMiB` — partition-table accounting is
+    // delegated to the `gpt` crate's `find_free_sectors`. Porting these
+    // 1:1 would require reimplementing the Go helper, which is out of
+    // scope for this test pass. Documented with TODO + ignored.
+    // -----------------------------------------------------------------
+
+    #[test]
+    #[ignore = "TODO: yip-rs has no CheckDiskFreeSpaceMiB equivalent — \
+                free-space accounting lives inside the `gpt` crate's \
+                find_free_sectors. Port once we expose a `Disk` helper."]
+    fn go_layout_computes_correct_free_space_with_one_partition() {
+        // Intent: 10 GiB disk, one 4 GiB partition at 1 MiB.
+        // 32 MiB check passes, 7000 MiB check fails. Also guards
+        // against the uint64 wrap-around bug the Go test was added for.
+    }
+
+    #[test]
+    #[ignore = "TODO: yip-rs has no CheckDiskFreeSpaceMiB equivalent — \
+                see go_layout_computes_correct_free_space_with_one_partition."]
+    fn go_layout_computes_correct_free_space_with_multiple_partitions() {
+        // Intent: 100 GiB disk, 20 GiB + 30 GiB partitions, ~50 GiB
+        // free. 32 MiB check passes, 60 GiB check fails.
+    }
+
+    #[test]
+    #[ignore = "TODO: yip-rs has no CheckDiskFreeSpaceMiB equivalent — \
+                see go_layout_computes_correct_free_space_with_one_partition."]
+    fn go_layout_returns_false_when_disk_is_nearly_full() {
+        // Intent: 1 GiB disk filled almost entirely; 32 MiB free check
+        // returns false.
+    }
 }

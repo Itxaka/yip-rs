@@ -467,4 +467,211 @@ mod tests {
             .count();
         assert_eq!(reloads, 1);
     }
+
+    // -------------------------------------------------------------------
+    // Direct ports of every Ginkgo `It` block from
+    // yip's `pkg/plugins/systemctl_test.go` (7 cases). Some overlap with
+    // tests above; kept as separate `#[test] fn`s so the Go→Rust mapping
+    // stays one-to-one and easy to audit.
+    // -------------------------------------------------------------------
+
+    /// Port of Go It: "starts and enables services". Enable=[foo],
+    /// Disable=[bar], Mask=[baz], Start=[moz] — exact command list and
+    /// order asserted.
+    #[test]
+    fn go_port_starts_and_enables_services() {
+        let stage = Stage {
+            systemctl: Systemctl {
+                enable: vec!["foo".into()],
+                disable: vec!["bar".into()],
+                mask: vec!["baz".into()],
+                start: vec!["moz".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        run(&stage, &fs, &console).expect("ok");
+        assert_eq!(
+            console.commands(),
+            vec![
+                "systemctl enable foo".to_string(),
+                "systemctl disable bar".to_string(),
+                "systemctl mask baz".to_string(),
+                "systemctl start moz".to_string(),
+            ]
+        );
+    }
+
+    /// Port of Go It: "creates override files". Service "foo.service",
+    /// no custom name → file at
+    /// `/etc/systemd/system/foo.service.d/override-yip.conf` with the
+    /// exact content. No systemctl enable/disable/mask/start commands
+    /// emitted.
+    #[test]
+    fn go_port_creates_override_files() {
+        let stage = Stage {
+            systemctl: Systemctl {
+                overrides: vec![SystemctlOverride {
+                    service: "foo.service".into(),
+                    content: "[Unit]\nbar=baz".into(),
+                    name: String::new(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        run(&stage, &fs, &console).expect("ok");
+        let path = Path::new("/etc/systemd/system/foo.service.d/override-yip.conf");
+        assert!(fs.exists(path));
+        assert_eq!(fs.read_to_string(path).unwrap(), "[Unit]\nbar=baz");
+        // Go test asserts no enable/disable/mask/start was emitted. The
+        // Rust port additionally fires one daemon-reload after writing
+        // overrides; assert that only that command was recorded.
+        assert_eq!(
+            console.commands(),
+            vec!["systemctl daemon-reload".to_string()]
+        );
+    }
+
+    /// Port of Go It: "creates override files if service is given
+    /// without extension". Service "foo" → directory still becomes
+    /// `foo.service.d`.
+    #[test]
+    fn go_port_creates_override_files_when_service_has_no_ext() {
+        let stage = Stage {
+            systemctl: Systemctl {
+                overrides: vec![SystemctlOverride {
+                    service: "foo".into(),
+                    content: "[Unit]\nbar=baz".into(),
+                    name: String::new(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        run(&stage, &fs, &console).expect("ok");
+        let path = Path::new("/etc/systemd/system/foo.service.d/override-yip.conf");
+        assert!(fs.exists(path));
+        assert_eq!(fs.read_to_string(path).unwrap(), "[Unit]\nbar=baz");
+        assert_eq!(
+            console.commands(),
+            vec!["systemctl daemon-reload".to_string()]
+        );
+    }
+
+    /// Port of Go It: "creates override files with custom override file
+    /// name". Name="override-foo.conf" → that exact filename. The
+    /// default `override-yip.conf` should NOT exist.
+    #[test]
+    fn go_port_creates_override_files_with_custom_name() {
+        let stage = Stage {
+            systemctl: Systemctl {
+                overrides: vec![SystemctlOverride {
+                    service: "foo.service".into(),
+                    content: "[Unit]\nbar=baz".into(),
+                    name: "override-foo.conf".into(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        run(&stage, &fs, &console).expect("ok");
+        assert!(!fs.exists(Path::new(
+            "/etc/systemd/system/foo.service.d/override-yip.conf"
+        )));
+        let custom = Path::new("/etc/systemd/system/foo.service.d/override-foo.conf");
+        assert!(fs.exists(custom));
+        assert_eq!(fs.read_to_string(custom).unwrap(), "[Unit]\nbar=baz");
+        assert_eq!(
+            console.commands(),
+            vec!["systemctl daemon-reload".to_string()]
+        );
+    }
+
+    /// Port of Go It: "creates override files with custom override file
+    /// name missing the extension". Name="override-foo" (no `.conf`) →
+    /// plugin appends `.conf`, producing `override-foo.conf`.
+    #[test]
+    fn go_port_custom_name_missing_extension_gets_conf_appended() {
+        let stage = Stage {
+            systemctl: Systemctl {
+                overrides: vec![SystemctlOverride {
+                    service: "foo.service".into(),
+                    content: "[Unit]\nbar=baz".into(),
+                    name: "override-foo".into(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        run(&stage, &fs, &console).expect("ok");
+        assert!(!fs.exists(Path::new(
+            "/etc/systemd/system/foo.service.d/override-yip.conf"
+        )));
+        let custom = Path::new("/etc/systemd/system/foo.service.d/override-foo.conf");
+        assert!(fs.exists(custom));
+        assert_eq!(fs.read_to_string(custom).unwrap(), "[Unit]\nbar=baz");
+        assert_eq!(
+            console.commands(),
+            vec!["systemctl daemon-reload".to_string()]
+        );
+    }
+
+    /// Port of Go It: "doesn't do anything if service name is missing".
+    /// Empty service string → no directory is created, no commands run.
+    /// Go also checks the log buffer contains
+    /// `ErrorEmptyOverrideService`; we don't capture tracing output, but
+    /// the observable filesystem/console state is asserted.
+    #[test]
+    fn go_port_noop_when_service_name_missing() {
+        let stage = Stage {
+            systemctl: Systemctl {
+                overrides: vec![SystemctlOverride {
+                    service: String::new(),
+                    content: "[Unit]\nbar=baz".into(),
+                    name: String::new(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        run(&stage, &fs, &console).expect("ok");
+        // Nothing under /etc/systemd/system should have been created.
+        assert!(!fs.exists(Path::new("/etc/systemd/system/")));
+        assert!(console.commands().is_empty());
+    }
+
+    /// Port of Go It: "doesn't do anything if content is missing".
+    /// Service supplied but empty content → no directory, no commands.
+    #[test]
+    fn go_port_noop_when_content_missing() {
+        let stage = Stage {
+            systemctl: Systemctl {
+                overrides: vec![SystemctlOverride {
+                    service: "test.service".into(),
+                    content: String::new(),
+                    name: String::new(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        run(&stage, &fs, &console).expect("ok");
+        assert!(!fs.exists(Path::new("/etc/systemd/system/")));
+        assert!(console.commands().is_empty());
+    }
 }

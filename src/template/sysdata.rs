@@ -244,4 +244,171 @@ HOME_URL=https://example.com
             assert!(!name.is_empty(), "expected NAME from /etc/os-release");
         }
     }
+
+    // -----------------------------------------------------------------
+    // Extended coverage: sysdata shape, parser edge cases, integration.
+
+    #[test]
+    fn gather_sysdata_returns_all_expected_keys() {
+        // The yip Go side exposes a fixed set of slots that kairos
+        // configs depend on. Verify every one of them is present
+        // (value may be empty when host has no source for it).
+        let v = gather_sysdata().unwrap();
+        let expected = [
+            "/Values/System/OS/Name",
+            "/Values/System/OS/Version",
+            "/Values/System/OS/Id",
+            "/Values/System/OS/PrettyName",
+            "/Values/System/Arch",
+            "/Values/System/Hostname",
+            "/Values/System/Kernel",
+            "/Values/System/MachineId",
+            "/Values/System/Random",
+            "/Values/System/Random32",
+            "/Values/Random",
+            "/Values/ProtectedID",
+        ];
+        for path in expected {
+            assert!(
+                v.pointer(path).is_some(),
+                "missing expected sysdata key: {path}"
+            );
+        }
+        // Random / Random32 are populated unconditionally and must
+        // not be empty even on a stripped host.
+        let random32 = v
+            .pointer("/Values/System/Random32")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert_eq!(random32.len(), 32);
+        let random_top = v
+            .pointer("/Values/Random")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert_eq!(random_top.len(), 32);
+    }
+
+    #[test]
+    fn parse_os_release_handles_extra_keys() {
+        // VERSION_CODENAME, ID_LIKE, HOME_URL are typical extras that
+        // kairos configs may reference. They aren't first-class fields
+        // on OsRelease but must land in `extra`.
+        let body = r#"
+NAME="Ubuntu"
+VERSION="22.04.3 LTS (Jammy Jellyfish)"
+ID=ubuntu
+ID_LIKE=debian
+VERSION_CODENAME=jammy
+HOME_URL="https://www.ubuntu.com/"
+SUPPORT_URL="https://help.ubuntu.com/"
+"#;
+        let r = parse_os_release_string(body);
+        assert_eq!(r.name, "Ubuntu");
+        assert_eq!(r.id, "ubuntu");
+        assert_eq!(
+            r.extra.get("ID_LIKE").map(String::as_str),
+            Some("debian")
+        );
+        assert_eq!(
+            r.extra.get("VERSION_CODENAME").map(String::as_str),
+            Some("jammy")
+        );
+        assert_eq!(
+            r.extra.get("HOME_URL").map(String::as_str),
+            Some("https://www.ubuntu.com/")
+        );
+        assert_eq!(
+            r.extra.get("SUPPORT_URL").map(String::as_str),
+            Some("https://help.ubuntu.com/")
+        );
+    }
+
+    #[test]
+    fn parse_os_release_no_quotes() {
+        // os-release values without any quoting must be captured
+        // verbatim. The unquote helper is a no-op for bare values.
+        let body = "\
+NAME=Kairos
+VERSION=2.5.0
+ID=kairos
+PRETTY_NAME=Kairos-bare
+HOME_URL=https://kairos.io
+";
+        let r = parse_os_release_string(body);
+        assert_eq!(r.name, "Kairos");
+        assert_eq!(r.version, "2.5.0");
+        assert_eq!(r.id, "kairos");
+        assert_eq!(r.pretty_name, "Kairos-bare");
+        assert_eq!(
+            r.extra.get("HOME_URL").map(String::as_str),
+            Some("https://kairos.io")
+        );
+    }
+
+    #[test]
+    fn parse_os_release_mixed_quote_styles() {
+        // Mix of single, double, and bare values — each must be
+        // unquoted correctly.
+        let body = "\
+NAME=\"Kairos\"
+VERSION='2.5.0'
+ID=kairos
+PRETTY_NAME=\"Kairos 2.5.0\"
+ANSI_COLOR='1;31'
+LOGO=plain-bare-value
+";
+        let r = parse_os_release_string(body);
+        assert_eq!(r.name, "Kairos");
+        assert_eq!(r.version, "2.5.0");
+        assert_eq!(r.id, "kairos");
+        assert_eq!(r.pretty_name, "Kairos 2.5.0");
+        assert_eq!(
+            r.extra.get("ANSI_COLOR").map(String::as_str),
+            Some("1;31")
+        );
+        assert_eq!(
+            r.extra.get("LOGO").map(String::as_str),
+            Some("plain-bare-value")
+        );
+    }
+
+    #[test]
+    fn gather_sysdata_integration_with_render() {
+        // For each documented sysdata key, render a template that
+        // references the path and assert we get back the same value
+        // that gather_sysdata() produced. This is the contract every
+        // ported kairos config depends on.
+        let data = gather_sysdata().unwrap();
+
+        let cases: &[(&str, &str)] = &[
+            ("{{ .Values.System.OS.Name }}", "/Values/System/OS/Name"),
+            ("{{ .Values.System.OS.Version }}", "/Values/System/OS/Version"),
+            ("{{ .Values.System.OS.Id }}", "/Values/System/OS/Id"),
+            (
+                "{{ .Values.System.OS.PrettyName }}",
+                "/Values/System/OS/PrettyName",
+            ),
+            ("{{ .Values.System.Arch }}", "/Values/System/Arch"),
+            ("{{ .Values.System.Hostname }}", "/Values/System/Hostname"),
+            ("{{ .Values.System.Kernel }}", "/Values/System/Kernel"),
+            ("{{ .Values.System.MachineId }}", "/Values/System/MachineId"),
+            ("{{ .Values.System.Random }}", "/Values/System/Random"),
+            ("{{ .Values.System.Random32 }}", "/Values/System/Random32"),
+            ("{{ .Values.Random }}", "/Values/Random"),
+            ("{{ .Values.ProtectedID }}", "/Values/ProtectedID"),
+        ];
+
+        for (tmpl, ptr) in cases {
+            let expected = data
+                .pointer(ptr)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let got = crate::template::render(tmpl, &data).unwrap();
+            assert_eq!(
+                got, expected,
+                "template {tmpl} did not match sysdata at {ptr}"
+            );
+        }
+    }
 }

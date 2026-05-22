@@ -90,11 +90,62 @@ fn is_zero_i32(v: &i32) -> bool {
     *v == 0
 }
 
+/// Tolerant `u32` deserializer for `permissions:` fields.
+///
+/// Real-world Kairos configs and Go yip's YAML library both accept
+/// `permissions: 0644` (octal int), `permissions: "0644"` (octal string),
+/// `permissions: 420` (decimal int), and `permissions: 0o644` (Rust-style
+/// octal). serde's default `u32` impl rejects strings outright, so we add
+/// a custom visitor that handles all four forms.
+pub(crate) fn deserialize_perm_u32<'de, D>(d: D) -> std::result::Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct V;
+    impl<'de> Visitor<'de> for V {
+        type Value = u32;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a u32, or a string parseable as one (octal/decimal/0o-prefixed)")
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<u32, E> {
+            u32::try_from(v).map_err(|_| de::Error::custom("u32 overflow"))
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<u32, E> {
+            u32::try_from(v).map_err(|_| de::Error::custom("u32 out of range"))
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<u32, E> {
+            let s = v.trim();
+            // Leading "0o" / "0O" → explicit octal.
+            if let Some(rest) = s.strip_prefix("0o").or_else(|| s.strip_prefix("0O")) {
+                return u32::from_str_radix(rest, 8).map_err(de::Error::custom);
+            }
+            // Bare "0644" (leading 0 + digits): treat as octal (Unix mode convention).
+            if s.len() > 1 && s.starts_with('0') && s.chars().all(|c| c.is_ascii_digit()) {
+                return u32::from_str_radix(s, 8).map_err(de::Error::custom);
+            }
+            // Otherwise: plain decimal.
+            s.parse::<u32>().map_err(de::Error::custom)
+        }
+        fn visit_string<E: de::Error>(self, v: String) -> std::result::Result<u32, E> {
+            self.visit_str(&v)
+        }
+    }
+    d.deserialize_any(V)
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct File {
     #[serde(default, rename = "path", skip_serializing_if = "String::is_empty")]
     pub path: String,
-    #[serde(default, rename = "permissions", skip_serializing_if = "is_zero_u32")]
+    #[serde(
+        default,
+        rename = "permissions",
+        skip_serializing_if = "is_zero_u32",
+        deserialize_with = "deserialize_perm_u32"
+    )]
     pub permissions: u32,
     #[serde(default, rename = "owner", skip_serializing_if = "owner_is_default")]
     pub owner: OwnerId,
@@ -117,7 +168,12 @@ pub struct Download {
     pub path: String,
     #[serde(default, rename = "url", skip_serializing_if = "String::is_empty")]
     pub url: String,
-    #[serde(default, rename = "permissions", skip_serializing_if = "is_zero_u32")]
+    #[serde(
+        default,
+        rename = "permissions",
+        skip_serializing_if = "is_zero_u32",
+        deserialize_with = "deserialize_perm_u32"
+    )]
     pub permissions: u32,
     #[serde(default, rename = "owner", skip_serializing_if = "owner_is_default")]
     pub owner: OwnerId,
@@ -133,7 +189,12 @@ pub struct Download {
 pub struct Directory {
     #[serde(default, rename = "path", skip_serializing_if = "String::is_empty")]
     pub path: String,
-    #[serde(default, rename = "permissions", skip_serializing_if = "is_zero_u32")]
+    #[serde(
+        default,
+        rename = "permissions",
+        skip_serializing_if = "is_zero_u32",
+        deserialize_with = "deserialize_perm_u32"
+    )]
     pub permissions: u32,
     #[serde(default, rename = "owner", skip_serializing_if = "owner_is_default")]
     pub owner: OwnerId,
@@ -145,6 +206,7 @@ pub struct Directory {
 mod tests {
     use super::*;
     use indoc::indoc;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn file_parses_numeric_owner() {
@@ -259,5 +321,141 @@ mod tests {
         let s = serde_yaml::to_string(&f).unwrap();
         let back: File = serde_yaml::from_str(&s).unwrap();
         assert_eq!(back, f);
+    }
+
+    #[test]
+    fn file_minimal_yaml_only_path() {
+        // The smallest meaningful File YAML — only a path.
+        let f: File = serde_yaml::from_str("path: /etc/x\n").unwrap();
+        assert_eq!(f.path, "/etc/x");
+        assert_eq!(f.permissions, 0);
+        assert_eq!(f.owner, OwnerId::Numeric(0));
+        assert_eq!(f.group, 0);
+        assert!(f.content.is_empty());
+        assert!(f.encoding.is_empty());
+        assert!(f.owner_string.is_empty());
+    }
+
+    #[test]
+    fn file_maximal_yaml() {
+        // Every File field set.
+        let y = indoc! {r#"
+            path: /etc/maxi
+            permissions: 384
+            owner: 42
+            group: 43
+            content: "hello"
+            encoding: plain
+            ownerstring: somebody
+        "#};
+        let f: File = serde_yaml::from_str(y).unwrap();
+        assert_eq!(f.path, "/etc/maxi");
+        assert_eq!(f.permissions, 384);
+        assert_eq!(f.owner, OwnerId::Numeric(42));
+        assert_eq!(f.group, 43);
+        assert_eq!(f.content, "hello");
+        assert_eq!(f.encoding, "plain");
+        assert_eq!(f.owner_string, "somebody");
+    }
+
+    #[test]
+    fn file_binary_content_b64_encoding() {
+        // Edge case: binary content stored as base64 string in `content`.
+        // Field stays a String (yip just stores it), encoding tells the
+        // plugin how to interpret.
+        let y = indoc! {r#"
+            path: /tmp/bin
+            content: aGVsbG8=
+            encoding: b64
+        "#};
+        let f: File = serde_yaml::from_str(y).unwrap();
+        assert_eq!(f.encoding, "b64");
+        assert_eq!(f.content, "aGVsbG8=");
+    }
+
+    #[test]
+    fn file_default_omits_all_fields_in_yaml() {
+        let s = serde_yaml::to_string(&File::default()).unwrap();
+        // All fields are skip_serializing_if their defaults, so YAML is empty.
+        assert!(!s.contains("path"));
+        assert!(!s.contains("permissions"));
+        assert!(!s.contains("owner"));
+        assert!(!s.contains("content"));
+        assert!(!s.contains("encoding"));
+        assert!(!s.contains("ownerstring"));
+    }
+
+    #[test]
+    fn ownerid_as_int_and_as_name() {
+        assert_eq!(OwnerId::Numeric(7).as_int(), 7);
+        assert_eq!(OwnerId::Numeric(7).as_name(), None);
+        assert_eq!(OwnerId::Name("bob".into()).as_int(), 0);
+        assert_eq!(OwnerId::Name("bob".into()).as_name(), Some("bob"));
+        // Empty name reports as None.
+        assert_eq!(OwnerId::Name(String::new()).as_name(), None);
+    }
+
+    #[test]
+    fn ownerid_default_is_numeric_zero() {
+        assert_eq!(OwnerId::default(), OwnerId::Numeric(0));
+    }
+
+    #[test]
+    fn download_minimal_yaml() {
+        let d: Download = serde_yaml::from_str("url: https://x/y\n").unwrap();
+        assert_eq!(d.url, "https://x/y");
+        assert!(d.path.is_empty());
+        assert_eq!(d.timeout, 0);
+    }
+
+    #[test]
+    fn download_maximal_roundtrip() {
+        let d = Download {
+            path: "/srv/p".into(),
+            url: "https://a/b".into(),
+            permissions: 0o600,
+            owner: OwnerId::Name("svc".into()),
+            group: 99,
+            timeout: 60,
+            owner_string: "svc".into(),
+        };
+        let s = serde_yaml::to_string(&d).unwrap();
+        let back: Download = serde_yaml::from_str(&s).unwrap();
+        assert_eq!(back, d);
+    }
+
+    #[test]
+    fn download_defaults_for_empty_yaml() {
+        let d: Download = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(d, Download::default());
+    }
+
+    #[test]
+    fn directory_maximal_roundtrip() {
+        let d = Directory {
+            path: "/var/d".into(),
+            permissions: 0o755,
+            owner: OwnerId::Numeric(1001),
+            group: 1001,
+        };
+        let s = serde_yaml::to_string(&d).unwrap();
+        let back: Directory = serde_yaml::from_str(&s).unwrap();
+        assert_eq!(back, d);
+    }
+
+    #[test]
+    fn directory_default_for_empty_yaml() {
+        let d: Directory = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(d, Directory::default());
+    }
+
+    #[test]
+    fn directory_with_string_owner() {
+        let y = indoc! {r#"
+            path: /opt/x
+            owner: deploy
+        "#};
+        let d: Directory = serde_yaml::from_str(y).unwrap();
+        assert_eq!(d.owner, OwnerId::Name("deploy".into()));
     }
 }

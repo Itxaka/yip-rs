@@ -312,4 +312,30 @@ mod tests {
         let fs = fs_with_version("22.04_rc1");
         assert_eq!(run(&stage, &fs), ConditionalOutcome::Run);
     }
+
+    // --- Direct ports of Go's `if_test.go` `IfOsVersionConditional` Describe ---
+    // Source: yip/pkg/plugins/if_test.go, Describe("IfOsVersionConditional"),
+    // 1 It block.
+    //
+    // Divergence note: Go asserts on the error message containing
+    // `SkipOnlyOsVersion` formatted with "weird". The Rust port returns
+    // `ConditionalOutcome::Skip` instead of propagating the error string,
+    // so we assert on the outcome.
+
+    /// Go: `Describe("IfOsVersionConditional") It("Executes")` —
+    /// `OnlyIfOsVersion: "weird"` must Skip. Go's BeforeEach does not seed
+    /// `/etc/os-release` so VERSION_ID is empty on the host's real fs; here
+    /// we use `MemVfs` with no os-release file to match that deterministically.
+    #[test]
+    fn go_port_if_os_version_conditional_executes_weird_pattern_skips() {
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        let stage = Stage {
+            only_if_os_version: "weird".into(),
+            ..Default::default()
+        };
+        let out = check(&stage, &fs, &console).expect("check ok");
+        assert_eq!(out, ConditionalOutcome::Skip);
+        assert!(console.commands().is_empty());
+    }
 }

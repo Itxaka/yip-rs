@@ -286,4 +286,93 @@ mod tests {
         // which TempVfs rebases. Use "/" as the conceptual root.
         trait_roundtrip(&vfs, Path::new("/"));
     }
+
+    // ---- edge cases ----
+
+    #[test]
+    fn binary_data_with_nulls_and_non_utf8() {
+        let vfs = TempVfs::new().unwrap();
+        let payload: Vec<u8> = vec![0x00, 0xFF, 0x00, 0xFE, 0x7F, 0x80, 0x00];
+        vfs.write(Path::new("/bin"), &payload).unwrap();
+        assert_eq!(vfs.read(Path::new("/bin")).unwrap(), payload);
+        assert!(vfs.read_to_string(Path::new("/bin")).is_err());
+    }
+
+    #[test]
+    fn read_dir_empty_vs_hundred_entries() {
+        let vfs = TempVfs::new().unwrap();
+        vfs.mkdir_all(Path::new("/empty")).unwrap();
+        assert_eq!(vfs.read_dir(Path::new("/empty")).unwrap().len(), 0);
+
+        for i in 0..100 {
+            vfs.write(Path::new(&format!("/big/f{i:03}")), b"x").unwrap();
+        }
+        let mut entries = vfs.read_dir(Path::new("/big")).unwrap();
+        assert_eq!(entries.len(), 100);
+        entries.sort();
+        let first = entries[0].file_name().unwrap().to_string_lossy().into_owned();
+        let last = entries[99].file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(first, "f000");
+        assert_eq!(last, "f099");
+    }
+
+    #[test]
+    fn walk_with_dangling_symlink() {
+        let vfs = TempVfs::new().unwrap();
+        vfs.mkdir_all(Path::new("/d")).unwrap();
+        vfs.symlink(Path::new("/does-not-exist"), Path::new("/d/dangle")).unwrap();
+        // Walking shouldn't include the dangling link as a regular file.
+        let files = vfs.walk(Path::new("/d")).unwrap();
+        assert!(files.iter().all(|p| !p.ends_with("dangle")));
+    }
+
+    #[test]
+    fn mkdir_all_when_component_is_a_file_errors() {
+        let vfs = TempVfs::new().unwrap();
+        vfs.write(Path::new("/blocker"), b"x").unwrap();
+        let err = vfs.mkdir_all(Path::new("/blocker/child")).unwrap_err();
+        assert!(matches!(err, Error::Io { .. }));
+    }
+
+    #[test]
+    fn chmod_on_missing_path_errors() {
+        let vfs = TempVfs::new().unwrap();
+        let err = vfs.chmod(Path::new("/nope"), 0o600).unwrap_err();
+        assert!(matches!(err, Error::Io { .. }));
+    }
+
+    #[test]
+    fn chown_neg_one_neg_one_is_noop() {
+        let vfs = TempVfs::new().unwrap();
+        vfs.write(Path::new("/f"), b"x").unwrap();
+        let before = vfs.metadata(Path::new("/f")).unwrap();
+        let _ = vfs.chown(Path::new("/f"), -1, -1);
+        let after = vfs.metadata(Path::new("/f")).unwrap();
+        assert_eq!((before.uid, before.gid), (after.uid, after.gid));
+    }
+
+    #[test]
+    fn remove_all_missing_is_idempotent() {
+        let vfs = TempVfs::new().unwrap();
+        vfs.remove_all(Path::new("/never")).unwrap();
+        vfs.remove_all(Path::new("/never")).unwrap();
+    }
+
+    #[test]
+    fn write_overwrites_existing_with_truncation() {
+        let vfs = TempVfs::new().unwrap();
+        vfs.write(Path::new("/ow"), b"longer original content").unwrap();
+        vfs.write(Path::new("/ow"), b"hi").unwrap();
+        assert_eq!(vfs.read(Path::new("/ow")).unwrap(), b"hi");
+        assert_eq!(vfs.metadata(Path::new("/ow")).unwrap().size, 2);
+    }
+
+    #[test]
+    fn symlink_loop_walk_terminates() {
+        let vfs = TempVfs::new().unwrap();
+        vfs.mkdir_all(Path::new("/loop")).unwrap();
+        vfs.symlink(Path::new("/loop/b"), Path::new("/loop/a")).unwrap();
+        vfs.symlink(Path::new("/loop/a"), Path::new("/loop/b")).unwrap();
+        let _ = vfs.walk(Path::new("/loop")).unwrap();
+    }
 }

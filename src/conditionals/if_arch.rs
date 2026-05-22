@@ -64,7 +64,7 @@ pub fn check(stage: &Stage, _fs: &dyn Vfs, _console: &dyn Console) -> Result<Con
 mod tests {
     use super::*;
     use crate::console::RecordingConsole;
-    use crate::vfs::RealVfs;
+    use crate::vfs::{MemVfs, RealVfs};
 
     #[test]
     fn empty_only_arch_runs() {
@@ -222,5 +222,51 @@ mod tests {
         let console = RecordingConsole::new();
         let out = check(&stage, &fs, &console).expect("check ok");
         assert_eq!(out, ConditionalOutcome::Run);
+    }
+
+    // --- Direct ports of Go's `if_test.go` `IfArchConditional` Describe ---
+    // Source: yip/pkg/plugins/if_test.go, Describe("IfArchConditional"),
+    // 2 It blocks.
+    //
+    // Divergence notes:
+    //   - Go's test asserts on a textual error containing the formatted
+    //     `SkipOnlyArch` template with `runtime.GOARCH` + the pattern. The
+    //     Rust port collapses conditional errors to
+    //     `ConditionalOutcome::Skip`, so we assert on the outcome.
+    //   - `runtime.GOARCH` differs from `std::env::consts::ARCH` (Go uses
+    //     "amd64"/"arm64", Rust uses "x86_64"/"aarch64"). The "Succeeds"
+    //     Go test uses `runtime.GOARCH` as the regex; we use
+    //     `std::env::consts::ARCH` — semantically "match the host arch".
+    //   - The Go suite uses a vfst seeded with /etc/hostname and /etc/hosts,
+    //     but `IfArch` never reads the fs. We use `MemVfs` (per scope) and
+    //     `RecordingConsole::default()` and verify nothing is written/run.
+
+    /// Go: `It("Fails with no match")` — `OnlyIfArch: "weird"` must Skip.
+    #[test]
+    fn go_port_if_arch_fails_with_no_match() {
+        let stage = Stage {
+            only_if_arch: "weird".into(),
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        let out = check(&stage, &fs, &console).expect("check ok");
+        assert_eq!(out, ConditionalOutcome::Skip);
+        assert!(console.commands().is_empty());
+    }
+
+    /// Go: `It("Succeeds")` — `OnlyIfArch: runtime.GOARCH` (Rust equivalent:
+    /// `std::env::consts::ARCH`) must Run.
+    #[test]
+    fn go_port_if_arch_succeeds_on_runtime_arch() {
+        let stage = Stage {
+            only_if_arch: std::env::consts::ARCH.to_string(),
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        let out = check(&stage, &fs, &console).expect("check ok");
+        assert_eq!(out, ConditionalOutcome::Run);
+        assert!(console.commands().is_empty());
     }
 }

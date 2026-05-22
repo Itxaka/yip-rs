@@ -64,6 +64,7 @@ fn is_zero_u64(v: &u64) -> bool {
 mod tests {
     use super::*;
     use indoc::indoc;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn parses_full_layout() {
@@ -124,5 +125,127 @@ mod tests {
         let s = serde_yaml::to_string(&l).unwrap();
         let back: Layout = serde_yaml::from_str(&s).unwrap();
         assert_eq!(back, l);
+    }
+
+    #[test]
+    fn minimal_layout_only_device_path() {
+        let y = indoc! {r#"
+            device:
+              path: /dev/sda
+        "#};
+        let l: Layout = serde_yaml::from_str(y).unwrap();
+        let d = l.device.as_ref().unwrap();
+        assert_eq!(d.path, "/dev/sda");
+        assert!(d.label.is_empty());
+        assert!(!d.init_disk);
+        assert!(l.expand.is_none());
+        assert!(l.parts.is_empty());
+    }
+
+    #[test]
+    fn layout_with_no_parts_serialises_without_add_partitions() {
+        // Edge case: empty parts vec must not produce `add_partitions:` key.
+        let l = Layout {
+            device: Some(Device {
+                path: "/dev/sda".into(),
+                ..Default::default()
+            }),
+            expand: None,
+            parts: Vec::new(),
+        };
+        let s = serde_yaml::to_string(&l).unwrap();
+        assert!(!s.contains("add_partitions"));
+        assert!(!s.contains("expand_partition"));
+        let back: Layout = serde_yaml::from_str(&s).unwrap();
+        assert_eq!(back, l);
+    }
+
+    #[test]
+    fn yaml_keys_match_go_tags() {
+        // add_partitions, expand_partition, fsLabel, pLabel, filesystem,
+        // init_disk, disk_name.
+        let y = indoc! {r#"
+            device:
+              init_disk: true
+              disk_name: d
+              path: /dev/sdb
+            expand_partition:
+              size: 2048
+            add_partitions:
+              - fsLabel: F
+                pLabel: P
+                filesystem: ext4
+                size: 512
+                bootable: true
+        "#};
+        let l: Layout = serde_yaml::from_str(y).unwrap();
+        let d = l.device.as_ref().unwrap();
+        assert!(d.init_disk);
+        assert_eq!(d.disk_name, "d");
+        assert_eq!(d.path, "/dev/sdb");
+        assert_eq!(l.expand.as_ref().unwrap().size, 2048);
+        let p = &l.parts[0];
+        assert_eq!(p.fs_label, "F");
+        assert_eq!(p.p_label, "P");
+        assert_eq!(p.file_system, "ext4");
+        assert_eq!(p.size, 512);
+        assert!(p.bootable);
+    }
+
+    #[test]
+    fn partition_default_omits_fields() {
+        let s = serde_yaml::to_string(&Partition::default()).unwrap();
+        assert!(!s.contains("fsLabel"));
+        assert!(!s.contains("pLabel"));
+        assert!(!s.contains("filesystem"));
+        assert!(!s.contains("bootable"));
+        assert!(!s.contains("size"));
+    }
+
+    #[test]
+    fn maximal_layout_roundtrip() {
+        let l = Layout {
+            device: Some(Device {
+                init_disk: true,
+                disk_name: "primary".into(),
+                label: "gpt".into(),
+                path: "/dev/sda".into(),
+            }),
+            expand: Some(ExpandPartition { size: 8192 }),
+            parts: vec![
+                Partition {
+                    fs_label: "BOOT".into(),
+                    size: 256,
+                    p_label: "boot".into(),
+                    file_system: "vfat".into(),
+                    bootable: true,
+                },
+                Partition {
+                    fs_label: "DATA".into(),
+                    size: 0,
+                    p_label: "data".into(),
+                    file_system: "ext4".into(),
+                    bootable: false,
+                },
+            ],
+        };
+        let s = serde_yaml::to_string(&l).unwrap();
+        let back: Layout = serde_yaml::from_str(&s).unwrap();
+        assert_eq!(back, l);
+    }
+
+    #[test]
+    fn device_path_script_form_parses_as_string() {
+        // Edge case: script:// indirection is just a string value at the
+        // schema level — no special parsing happens here.
+        let y = indoc! {r#"
+            device:
+              path: "script:///usr/local/bin/find-disk.sh"
+        "#};
+        let l: Layout = serde_yaml::from_str(y).unwrap();
+        assert_eq!(
+            l.device.as_ref().unwrap().path,
+            "script:///usr/local/bin/find-disk.sh"
+        );
     }
 }
