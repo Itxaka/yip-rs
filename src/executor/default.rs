@@ -60,22 +60,41 @@ pub struct DefaultExecutor {
 
 impl DefaultExecutor {
     /// Construct an executor with the default plugin + conditional set
-    /// (matches Go `NewExecutor()`). Wave-2/3/4 agents register the actual
-    /// plugin functions in `crate::plugins` and `crate::conditionals`; for
-    /// now we wire empty stubs so this still compiles standalone.
+    /// (matches Go `NewExecutor()`).
     pub fn new() -> Self {
-        // NOTE: until the plugin / conditional modules land, `new()` ==
-        // `empty()` with the dot-notation modifier attached. The wave-2/3/4
-        // PRs will replace the body with explicit `with_plugin(...)` calls
-        // for each Go plugin: DNS, Download, Git, Entities, EnsureDirectories,
-        // EnsureFiles, Commands, DeleteEntities, Hostname, Sysctl, User, SSH,
-        // LoadModules, Timesyncd, Systemctl, Environment, SystemdFirstboot,
-        // DataSources, Layout, PackagePins, Packages, UnpackImage — in that
-        // order. Conditionals: NodeConditional, IfConditional, OnlyIfOS,
-        // OnlyIfOSVersion, IfArch, IfServiceManager, IfFiles.
-        Self::empty().with_modifier(Arc::new(|bytes: &[u8]| {
-            crate::schema::dot_notation_modifier(bytes)
-        }))
+        Self::empty()
+            .with_modifier(Arc::new(|bytes: &[u8]| {
+                crate::schema::dot_notation_modifier(bytes)
+            }))
+            .with_conditional("node", crate::conditionals::node::build())
+            .with_conditional("if", crate::conditionals::if_cond::build())
+            .with_conditional("only_if_os", crate::conditionals::only_if_os::build())
+            .with_conditional("only_if_os_version", crate::conditionals::only_if_os_version::build())
+            .with_conditional("if_arch", crate::conditionals::if_arch::build())
+            .with_conditional("if_service_manager", crate::conditionals::if_service_manager::build())
+            .with_conditional("if_files", crate::conditionals::if_files::build())
+            .with_plugin("dns", crate::plugins::dns::build())
+            .with_plugin("download", crate::plugins::download::build())
+            .with_plugin("git", crate::plugins::git::build())
+            .with_plugin("entities", crate::plugins::entities::build())
+            .with_plugin("directories", crate::plugins::directories::build())
+            .with_plugin("files", crate::plugins::files::build())
+            .with_plugin("commands", crate::plugins::commands::build())
+            .with_plugin("delete_entities", crate::plugins::entities::build_delete())
+            .with_plugin("hostname", crate::plugins::hostname::build())
+            .with_plugin("sysctl", crate::plugins::sysctl::build())
+            .with_plugin("user", crate::plugins::user::build())
+            .with_plugin("ssh", crate::plugins::ssh::build())
+            .with_plugin("modules", crate::plugins::modules::build())
+            .with_plugin("timesyncd", crate::plugins::timesyncd::build())
+            .with_plugin("systemctl", crate::plugins::systemctl::build())
+            .with_plugin("environment", crate::plugins::environment::build())
+            .with_plugin("systemd_firstboot", crate::plugins::systemd_firstboot::build())
+            .with_plugin("datasource", crate::plugins::datasource::build())
+            .with_plugin("layout", crate::plugins::layout::build())
+            .with_plugin("package_pins", crate::plugins::package_pins::build())
+            .with_plugin("packages", crate::plugins::packages::build())
+            .with_plugin("unpack_image", crate::plugins::unpack_image::build())
     }
 
     /// Construct an empty executor; useful for tests that want to inject
@@ -830,5 +849,26 @@ stages:
         let pos_a = l.iter().position(|s| s.ends_with(":a")).expect("a ran");
         let pos_b = l.iter().position(|s| s.ends_with(":b")).expect("b ran");
         assert!(pos_a < pos_b, "a must run before b: {l:?}");
+    }
+
+    #[test]
+    fn default_executor_registers_all_plugins() {
+        let exec = DefaultExecutor::new();
+        // 22 plugins: entities + delete_entities + the other 20.
+        // (Go has 23 because of UnpackImage having both enabled/disabled
+        // build variants — yip-rs collapses them under a feature flag.)
+        assert_eq!(exec.plugins.len(), 22, "expected 22 plugins, got {}", exec.plugins.len());
+        // Spot-check a few key names.
+        let names: Vec<&str> = exec.plugins.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"dns"));
+        assert!(names.contains(&"files"));
+        assert!(names.contains(&"users") || names.contains(&"user"));
+        assert!(names.contains(&"layout"));
+    }
+
+    #[test]
+    fn default_executor_registers_all_conditionals() {
+        let exec = DefaultExecutor::new();
+        assert_eq!(exec.conditionals.len(), 7, "expected 7 conditionals, got {}", exec.conditionals.len());
     }
 }

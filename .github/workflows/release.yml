@@ -1,0 +1,110 @@
+# Tag-triggered release for yip-rs.
+#
+# Reuses build.yml to produce the static musl binaries for the three
+# target architectures, then packages them into tarballs matching the
+# sibling immucore-rs naming scheme:
+#
+#   yip-vX.Y.Z-linux-amd64.tar.gz
+#   yip-vX.Y.Z-linux-arm64.tar.gz
+#   yip-vX.Y.Z-linux-riscv64.tar.gz
+#
+# A draft GitHub release is created via softprops/action-gh-release so a
+# maintainer can review and publish it manually.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write   # required by softprops/action-gh-release to create releases
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Reuse the build workflow so the artifacts come from one place and
+  # stay in sync with the matrix defined there.
+  build:
+    uses: ./.github/workflows/build.yml
+
+  release:
+    name: Package and publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Release tag: ${tag}"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package archives
+        id: package
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          shopt -s nullglob
+
+          for arch in amd64 arm64 riscv64; do
+            src_dir="artifacts/yip-linux-${arch}"
+            if [ ! -d "$src_dir" ]; then
+              echo "Missing artifact dir: $src_dir" >&2
+              exit 1
+            fi
+            bin="${src_dir}/yip"
+            if [ ! -f "$bin" ]; then
+              echo "Missing binary: $bin" >&2
+              exit 1
+            fi
+            chmod +x "$bin"
+
+            pkg="yip-${TAG}-linux-${arch}"
+            stage="release/${pkg}"
+            mkdir -p "$stage"
+            cp "$bin" "$stage/yip"
+            # Include LICENSE and README to match standard release layout.
+            [ -f LICENSE ] && cp LICENSE "$stage/" || true
+            [ -f README.md ] && cp README.md "$stage/" || true
+
+            tar -czf "release/${pkg}.tar.gz" -C release "$pkg"
+            rm -rf "$stage"
+            echo "Packaged release/${pkg}.tar.gz"
+          done
+
+          # Generate a checksums file matching the standard release convention.
+          ( cd release && sha256sum yip-${TAG}-*.tar.gz > "yip-${TAG}-checksums.txt" )
+          ls -la release/
+
+      - name: Create draft GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          draft: true
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            release/yip-${{ steps.tag.outputs.tag }}-linux-amd64.tar.gz
+            release/yip-${{ steps.tag.outputs.tag }}-linux-arm64.tar.gz
+            release/yip-${{ steps.tag.outputs.tag }}-linux-riscv64.tar.gz
+            release/yip-${{ steps.tag.outputs.tag }}-checksums.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

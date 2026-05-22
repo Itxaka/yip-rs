@@ -1,0 +1,119 @@
+# Multi-arch static (musl) builds for yip-rs.
+#
+# Mirrors the sibling immucore-rs build.yml architecture matrix:
+#   amd64    -> x86_64-unknown-linux-musl     (native, musl-tools)
+#   arm64    -> aarch64-unknown-linux-musl    (via cross)
+#   riscv64  -> riscv64gc-unknown-linux-musl  (via cross)
+#
+# `cross` (cross-rs/cross) is used for the non-host arches so the
+# containerized sysroots stay isolated from the runner image. For the
+# host arch we just install `musl-tools` and call cargo directly — that
+# is faster than spinning up the cross container for the host.
+#
+# Artifacts uploaded here are consumed by release.yml on tag pushes.
+
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*.*.*'
+  pull_request:
+  workflow_call:
+    # Allow release.yml to invoke this workflow and pull its artifacts.
+
+concurrency:
+  group: build-${{ github.head_ref || github.ref }}-${{ github.repository }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+            use_cross: false
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+            use_cross: true
+          - target: riscv64gc-unknown-linux-musl
+            arch: riscv64
+            use_cross: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl-tools (x86_64 native build only)
+        if: matrix.use_cross == false
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.use_cross == true
+        run: |
+          # cross 0.2.5 is the last released version; install from the
+          # cargo registry rather than git to keep the build hermetic.
+          cargo install cross --locked --version 0.2.5
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-build-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-${{ matrix.target }}-
+            ${{ runner.os }}-cargo-build-
+            ${{ runner.os }}-cargo-
+
+      - name: Build (cargo)
+        if: matrix.use_cross == false
+        run: cargo build --release --target ${{ matrix.target }} --locked
+
+      - name: Build (cross)
+        if: matrix.use_cross == true
+        run: cross build --release --target ${{ matrix.target }} --locked
+
+      - name: Stage artifact
+        id: stage
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          bin="target/${{ matrix.target }}/release/yip"
+          test -f "$bin"
+          # Quick sanity check that the binary is actually statically linked.
+          file "$bin" || true
+          cp "$bin" "dist/yip"
+          chmod +x dist/yip
+          echo "bin_path=dist/yip" >> "$GITHUB_OUTPUT"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yip-linux-${{ matrix.arch }}
+          path: ${{ steps.stage.outputs.bin_path }}
+          if-no-files-found: error
+          retention-days: 7

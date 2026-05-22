@@ -1,0 +1,8 @@
+name: yip-rs smoke
+stages:
+  rootfs:
+    - name: write-marker
+      files:
+        - path: /tmp/yip-rs-smoke
+          permissions: 0644
+          content: "hello from yip-rs"
