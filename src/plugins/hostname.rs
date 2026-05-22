@@ -164,4 +164,76 @@ mod tests {
             "viabuild\n"
         );
     }
+
+    // -------------------------------------------------------------------
+    // Ported from Go: FQDN, overwrites of pre-existing machine-id /
+    // hostname files.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn fqdn_hostname_with_dots_is_written_verbatim() {
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        let stage = Stage {
+            hostname: "host1.example.com".into(),
+            ..Default::default()
+        };
+        run(&stage, &fs, &console).expect("ok");
+        assert_eq!(
+            fs.read_to_string(Path::new(HOSTNAME_PATH)).unwrap(),
+            "host1.example.com\n"
+        );
+    }
+
+    #[test]
+    fn empty_pre_existing_machine_id_is_overwritten() {
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        // Seed an empty machine-id file (matches the Go default_test fixture).
+        fs.write(Path::new(MACHINE_ID_PATH), b"").unwrap();
+        let stage = Stage {
+            hostname: "h".into(),
+            ..Default::default()
+        };
+        run(&stage, &fs, &console).expect("ok");
+        let got = fs.read_to_string(Path::new(MACHINE_ID_PATH)).unwrap();
+        // No longer empty; 32 hex chars.
+        assert_eq!(got.len(), 32);
+        assert!(got.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn pre_existing_hostname_file_is_overwritten() {
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        // Pre-existing file contents must be replaced, not appended to.
+        fs.write(Path::new(HOSTNAME_PATH), b"oldhost\n").unwrap();
+        let stage = Stage {
+            hostname: "newhost".into(),
+            ..Default::default()
+        };
+        run(&stage, &fs, &console).expect("ok");
+        let got = fs.read_to_string(Path::new(HOSTNAME_PATH)).unwrap();
+        assert_eq!(got, "newhost\n");
+        assert!(!got.contains("oldhost"));
+    }
+
+    #[test]
+    fn two_runs_produce_different_machine_ids() {
+        // Machine-id is regenerated each run from a fresh v4 UUID; two
+        // consecutive plugin invocations against fresh filesystems should
+        // not collide. (Probability of UUID-v4 collision is astronomical.)
+        let stage = Stage {
+            hostname: "x".into(),
+            ..Default::default()
+        };
+        let fs1 = MemVfs::new();
+        let fs2 = MemVfs::new();
+        let con = RecordingConsole::default();
+        run(&stage, &fs1, &con).unwrap();
+        run(&stage, &fs2, &con).unwrap();
+        let a = fs1.read_to_string(Path::new(MACHINE_ID_PATH)).unwrap();
+        let b = fs2.read_to_string(Path::new(MACHINE_ID_PATH)).unwrap();
+        assert_ne!(a, b);
+    }
 }

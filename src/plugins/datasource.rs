@@ -590,4 +590,202 @@ mod tests {
         // Empty providers — just verifies the closure invokes without panic.
         plugin(&Stage::default(), &fs, &console).expect("closure ok");
     }
+
+    // --- Additional tests ported from Go behaviour expectations ---
+
+    #[test]
+    fn multiple_providers_first_success_wins() {
+        // Order matters: first provider that returns data is used; the rest
+        // are skipped (loop breaks). We exercise this by listing a stub
+        // first (errors), then nocloud (succeeds). The end userdata should
+        // come from nocloud.
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+
+        fs.mkdir_all(Path::new(NOCLOUD_SEED_DIR)).unwrap();
+        let body = b"#cloud-config\nhostname: from-nocloud\n";
+        fs.write(&Path::new(NOCLOUD_SEED_DIR).join("user-data"), body)
+            .unwrap();
+
+        // azure errors first, nocloud then wins.
+        let stage = stage_with(vec!["azure", "nocloud", "aws"], "", "");
+        run(&stage, &fs, &console).expect("ok");
+
+        let got = fs
+            .read(&Path::new(CONFIG_PATH).join("userdata"))
+            .expect("written");
+        assert_eq!(got, body);
+    }
+
+    #[test]
+    fn all_providers_fail_returns_no_metadata_error() {
+        // Every provider listed errors (all are stubs) — no data anywhere.
+        // The Go test asserts a specific error message; we match it.
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        let stage = stage_with(
+            vec!["azure", "gcp", "openstack", "digitalocean", "scaleway"],
+            "",
+            "",
+        );
+        let err = run(&stage, &fs, &console).expect_err("all stubs error");
+        assert!(
+            err.to_string().to_lowercase().contains("no metadata/userdata"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn nocloud_meta_data_without_user_data_skips_provider() {
+        // If user-data is missing but meta-data is present, nocloud reports
+        // a probe miss (Ok(None)). Combined with no other provider listed,
+        // we expect the "no metadata/userdata found" error.
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        fs.mkdir_all(Path::new(NOCLOUD_SEED_DIR)).unwrap();
+        fs.write(
+            &Path::new(NOCLOUD_SEED_DIR).join("meta-data"),
+            b"instance-id: iid-meta-only\n",
+        )
+        .unwrap();
+        // intentionally NO user-data.
+
+        let stage = stage_with(vec!["nocloud"], "", "");
+        let err = run(&stage, &fs, &console).expect_err("no user-data -> err");
+        assert!(err.to_string().to_lowercase().contains("no metadata/userdata"));
+    }
+
+    #[test]
+    fn invalid_yaml_userdata_falls_back_to_raw_only() {
+        // If the bytes can't parse as a yip Config (and don't start with
+        // `#!`), Process_userdata writes only the raw /userdata file —
+        // not the named userdata.yaml mirror.
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        // Body: looks like cloud-init userdata header but no valid yip
+        // structure (yip Config requires specific fields).
+        let body = b"#cloud-config\n  invalid: [unbalanced\n";
+        fs.mkdir_all(Path::new(NOCLOUD_SEED_DIR)).unwrap();
+        fs.write(&Path::new(NOCLOUD_SEED_DIR).join("user-data"), body)
+            .unwrap();
+
+        let stage = stage_with(vec!["nocloud"], "", "");
+        run(&stage, &fs, &console).expect("ok");
+
+        // Raw written.
+        let raw = fs
+            .read(&Path::new(CONFIG_PATH).join("userdata"))
+            .expect("raw present");
+        assert_eq!(raw, body);
+
+        // Named mirror absent — invalid YAML doesn't get mirrored.
+        let named = Path::new(CONFIG_PATH).join("userdata.yaml");
+        assert!(
+            !fs.exists(&named),
+            "invalid-yaml userdata must not mirror under default name",
+        );
+    }
+
+    #[test]
+    fn custom_userdata_name_01_userdata_yaml() {
+        // Direct port of the Go test: custom userdata_name = "01_userdata.yaml".
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+
+        let cfg = b"name: from-custom\n";
+        fs.mkdir_all(Path::new(NOCLOUD_SEED_DIR)).unwrap();
+        fs.write(&Path::new(NOCLOUD_SEED_DIR).join("user-data"), cfg)
+            .unwrap();
+
+        let stage = stage_with(vec!["nocloud"], "", "01_userdata.yaml");
+        run(&stage, &fs, &console).unwrap();
+
+        // The named file exists at the custom name.
+        let named = Path::new(CONFIG_PATH).join("01_userdata.yaml");
+        assert!(fs.exists(&named), "custom userdata_name should be written");
+        let got = fs.read(&named).expect("custom userdata mirror");
+        assert_eq!(got, cfg);
+
+        // The default name should NOT exist (only the custom one).
+        let default = Path::new(CONFIG_PATH).join("userdata.yaml");
+        assert!(
+            !fs.exists(&default),
+            "default-name file should not be written when custom name given",
+        );
+    }
+
+    #[test]
+    fn aws_userdata_endpoint_404_falls_back_to_no_data() {
+        // probe (hostname) succeeds, but user-data endpoint returns 404.
+        // The provider treats that as Ok(None) and the outer plugin returns
+        // "no metadata/userdata found".
+        let _g = AWS_ENV_LOCK.lock().unwrap();
+        let mut server = mockito::Server::new();
+        let base = format!("{}/latest/", server.url());
+
+        let _m_host = server
+            .mock("GET", "/latest/meta-data/hostname")
+            .with_status(200)
+            .with_body("host")
+            .create();
+        let _m_ud = server
+            .mock("GET", "/latest/user-data")
+            .with_status(404)
+            .create();
+
+        std::env::set_var(AWS_BASE_URL_ENV, &base);
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        let stage = stage_with(vec!["aws"], "", "");
+        let res = run(&stage, &fs, &console);
+        std::env::remove_var(AWS_BASE_URL_ENV);
+
+        let err = res.expect_err("user-data 404 -> no data");
+        assert!(err.to_string().to_lowercase().contains("no metadata/userdata"));
+    }
+
+    #[test]
+    fn provider_list_deduplicates_in_run_path() {
+        // Same provider listed many times must run at most as many times
+        // as there are unique providers — exercises `dedup` from `run`.
+        // We use only the `aws` stub via mockito; the probe is set up so
+        // a successful probe triggers exactly ONE user-data call, no
+        // matter how many "aws" entries appear.
+        let _g = AWS_ENV_LOCK.lock().unwrap();
+        let mut server = mockito::Server::new();
+        let base = format!("{}/latest/", server.url());
+
+        let _m_host = server
+            .mock("GET", "/latest/meta-data/hostname")
+            .with_status(200)
+            .with_body("dedup-host")
+            .expect(1)
+            .create();
+        let _m_ud = server
+            .mock("GET", "/latest/user-data")
+            .with_status(200)
+            .with_body("#cloud-config\nx: 1\n")
+            .expect(1)
+            .create();
+
+        std::env::set_var(AWS_BASE_URL_ENV, &base);
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        let stage = stage_with(
+            vec!["aws", "aws", "aws", "aws"],
+            "",
+            "",
+        );
+        let res = run(&stage, &fs, &console);
+        std::env::remove_var(AWS_BASE_URL_ENV);
+
+        res.expect("ok");
+        // mockito `.expect(1)` on each endpoint will panic on drop if
+        // the count is wrong. The explicit assertion below is just an
+        // additional sanity check on the resulting file.
+        let got = fs
+            .read(&Path::new(CONFIG_PATH).join("userdata"))
+            .expect("written");
+        assert_eq!(got, b"#cloud-config\nx: 1\n");
+    }
 }

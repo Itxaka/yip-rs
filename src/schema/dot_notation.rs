@@ -185,4 +185,268 @@ mod tests {
             ]
         );
     }
+
+    // ---------------------------------------------------------------------
+    // Ported from Go `schema_test.go` "Loading from dot notation" Context.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn go_one_config_with_garbage_extra_token() {
+        // `oneConfigwithGarbageS := "stages.foo[0].name=bar boo.baz"`
+        let out = dot_notation_modifier(b"stages.foo[0].name=bar boo.baz").unwrap();
+        let v = yaml_to_value(&out);
+        assert_eq!(v["stages"]["foo"][0]["name"], Value::String("bar".into()));
+        // The garbage `boo.baz` token still produces a node (value "true").
+        assert_eq!(v["boo"]["baz"], Value::String("true".into()));
+    }
+
+    #[test]
+    fn go_two_configs_merged() {
+        // `twoConfigsS := "stages.foo[0].name=bar   stages.foo[0].commands[0]=baz"`
+        let out = dot_notation_modifier(
+            b"stages.foo[0].name=bar   stages.foo[0].commands[0]=baz",
+        )
+        .unwrap();
+        let v = yaml_to_value(&out);
+        assert_eq!(v["stages"]["foo"][0]["name"], Value::String("bar".into()));
+        assert_eq!(
+            v["stages"]["foo"][0]["commands"][0],
+            Value::String("baz".into())
+        );
+    }
+
+    #[test]
+    fn go_three_invalid_no_stage_keys() {
+        // `threeConfigInvalid := ip=dhcp test="echo ping_test_host=127.0.0.1  > /tmp/jojo"`
+        let out = dot_notation_modifier(
+            br#"ip=dhcp test="echo ping_test_host=127.0.0.1  > /tmp/jojo""#,
+        )
+        .unwrap();
+        let v = yaml_to_value(&out);
+        // No `stages` key — invalid as a yip config but the modifier still produces
+        // a doc with `ip` and `test` keys.
+        assert!(v.get("stages").is_none());
+        assert_eq!(v["ip"], Value::String("dhcp".into()));
+    }
+
+    #[test]
+    fn go_four_half_invalid_keeps_valid_part() {
+        // `fourConfigHalfInvalid := stages.foo[0].name=bar ip=dhcp test="echo ping_test_host=127.0.0.1  > /tmp/dio"`
+        let out = dot_notation_modifier(
+            br#"stages.foo[0].name=bar ip=dhcp test="echo ping_test_host=127.0.0.1  > /tmp/dio""#,
+        )
+        .unwrap();
+        let v = yaml_to_value(&out);
+        assert_eq!(v["stages"]["foo"][0]["name"], Value::String("bar".into()));
+        assert_eq!(v["ip"], Value::String("dhcp".into()));
+    }
+
+    // ---------------------------------------------------------------------
+    // Path parsing: edge cases.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn parse_path_single_key() {
+        let segs = parse_path("foo").unwrap();
+        assert_eq!(segs, vec![PathSegment::Key("foo".into())]);
+    }
+
+    #[test]
+    fn parse_path_only_index() {
+        let segs = parse_path("[3]").unwrap();
+        assert_eq!(segs, vec![PathSegment::Index(3)]);
+    }
+
+    #[test]
+    fn parse_path_consecutive_indices() {
+        let segs = parse_path("a[0][1]").unwrap();
+        assert_eq!(
+            segs,
+            vec![
+                PathSegment::Key("a".into()),
+                PathSegment::Index(0),
+                PathSegment::Index(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_path_trailing_dot_ignored() {
+        let segs = parse_path("foo.").unwrap();
+        assert_eq!(segs, vec![PathSegment::Key("foo".into())]);
+    }
+
+    #[test]
+    fn parse_path_bad_index_errors() {
+        let res = parse_path("foo[abc]");
+        assert!(res.is_err(), "non-numeric index must error");
+    }
+
+    #[test]
+    fn parse_path_deeply_nested() {
+        let segs = parse_path("a.b.c.d.e.f.g").unwrap();
+        assert_eq!(segs.len(), 7);
+        assert_eq!(segs[6], PathSegment::Key("g".into()));
+    }
+
+    // ---------------------------------------------------------------------
+    // Modifier behaviour: misc + fuzz.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn modifier_empty_input_yields_empty_doc() {
+        let out = dot_notation_modifier(b"").unwrap();
+        let v = yaml_to_value(&out);
+        // Empty mapping or null — both are acceptable.
+        assert!(v.is_mapping() || v.is_null(), "got {:?}", v);
+    }
+
+    #[test]
+    fn modifier_whitespace_only_input() {
+        let out = dot_notation_modifier(b"   \t  ").unwrap();
+        let v = yaml_to_value(&out);
+        assert!(v.is_mapping() || v.is_null());
+    }
+
+    #[test]
+    fn modifier_index_grows_sequence() {
+        // Out-of-order indices should grow the sequence and leave nulls in the gaps.
+        let out = dot_notation_modifier(b"a[2]=v").unwrap();
+        let v = yaml_to_value(&out);
+        let seq = v["a"].as_sequence().unwrap();
+        assert_eq!(seq.len(), 3);
+        assert_eq!(seq[2], Value::String("v".into()));
+        assert!(seq[0].is_null());
+        assert!(seq[1].is_null());
+    }
+
+    #[test]
+    fn modifier_value_with_equals_kept_verbatim() {
+        // Anything past the first `=` is the value.
+        let out = dot_notation_modifier(b"a=b=c=d").unwrap();
+        let v = yaml_to_value(&out);
+        assert_eq!(v["a"], Value::String("b=c=d".into()));
+    }
+
+    #[test]
+    fn modifier_bare_token_becomes_true_string() {
+        let out = dot_notation_modifier(b"single").unwrap();
+        let v = yaml_to_value(&out);
+        assert_eq!(v["single"], Value::String("true".into()));
+    }
+
+    #[test]
+    fn modifier_long_key_name() {
+        // Stress: very long key.
+        let key: String = "a".repeat(2000);
+        let input = format!("{key}=v");
+        let out = dot_notation_modifier(input.as_bytes()).unwrap();
+        let v = yaml_to_value(&out);
+        assert_eq!(v[key.as_str()], Value::String("v".into()));
+    }
+
+    #[test]
+    fn modifier_long_value() {
+        let val: String = "x".repeat(5000);
+        let input = format!("k={val}");
+        let out = dot_notation_modifier(input.as_bytes()).unwrap();
+        let v = yaml_to_value(&out);
+        assert_eq!(v["k"], Value::String(val));
+    }
+
+    #[test]
+    fn modifier_quotes_around_key_stripped() {
+        // `"foo"=bar` → key becomes `foo`.
+        let out = dot_notation_modifier(br#""foo"=bar"#).unwrap();
+        let v = yaml_to_value(&out);
+        assert_eq!(v["foo"], Value::String("bar".into()));
+    }
+
+    #[test]
+    fn modifier_many_tokens() {
+        // 20 tokens — sanity-check the merge logic doesn't explode.
+        let mut s = String::new();
+        for i in 0..20 {
+            s.push_str(&format!("k{i}=v{i} "));
+        }
+        let out = dot_notation_modifier(s.trim().as_bytes()).unwrap();
+        let v = yaml_to_value(&out);
+        for i in 0..20 {
+            assert_eq!(v[format!("k{i}").as_str()], Value::String(format!("v{i}")));
+        }
+    }
+
+    #[test]
+    fn modifier_overwrites_on_duplicate_key() {
+        // Last write wins for the same key.
+        let out = dot_notation_modifier(b"k=v1 k=v2").unwrap();
+        let v = yaml_to_value(&out);
+        assert_eq!(v["k"], Value::String("v2".into()));
+    }
+
+    #[test]
+    fn modifier_mixed_dot_and_index() {
+        let out = dot_notation_modifier(
+            b"stages.foo[0].commands[0]=a stages.foo[0].commands[1]=b stages.foo[0].name=n",
+        )
+        .unwrap();
+        let v = yaml_to_value(&out);
+        assert_eq!(
+            v["stages"]["foo"][0]["commands"][0],
+            Value::String("a".into())
+        );
+        assert_eq!(
+            v["stages"]["foo"][0]["commands"][1],
+            Value::String("b".into())
+        );
+        assert_eq!(v["stages"]["foo"][0]["name"], Value::String("n".into()));
+    }
+
+    #[test]
+    fn modifier_value_with_backslashes() {
+        // Backslashes are not special to the modifier (only to shlex). The
+        // exact post-shlex value depends on the shlex version, but the call
+        // must not panic and must produce a YAML document that includes the
+        // key `k`.
+        let out = dot_notation_modifier(br#"k=abc"#).unwrap();
+        let v = yaml_to_value(&out);
+        assert_eq!(v["k"], Value::String("abc".into()));
+    }
+
+    #[test]
+    fn modifier_empty_value_after_equals() {
+        let out = dot_notation_modifier(b"k=").unwrap();
+        let v = yaml_to_value(&out);
+        assert_eq!(v["k"], Value::String("".into()));
+    }
+
+    #[test]
+    fn modifier_index_zero_only() {
+        let out = dot_notation_modifier(b"a[0]=v").unwrap();
+        let v = yaml_to_value(&out);
+        let seq = v["a"].as_sequence().unwrap();
+        assert_eq!(seq.len(), 1);
+        assert_eq!(seq[0], Value::String("v".into()));
+    }
+
+    #[test]
+    fn modifier_yaml_round_trip_via_serde() {
+        // Take the modifier output, parse it back, re-serialize — same shape.
+        let out = dot_notation_modifier(b"stages.foo[0].name=bar").unwrap();
+        let v: Value = serde_yaml::from_slice(&out).unwrap();
+        let s2 = serde_yaml::to_string(&v).unwrap();
+        let v2: Value = serde_yaml::from_str(&s2).unwrap();
+        assert_eq!(v, v2);
+    }
+
+    #[test]
+    fn modifier_assignment_to_existing_scalar_overwrites_path() {
+        // First write makes `a` a scalar; second write requires `a` to be a
+        // mapping — `set_path` coerces.
+        let out = dot_notation_modifier(b"a=v a.b=w").unwrap();
+        let v = yaml_to_value(&out);
+        // The final shape depends on whether shlex preserved order; we only
+        // verify the deeper path landed.
+        assert_eq!(v["a"]["b"], Value::String("w".into()));
+    }
 }

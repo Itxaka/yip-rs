@@ -234,4 +234,61 @@ mod tests {
             "ignored"
         );
     }
+
+    // -------------------------------------------------------------------
+    // Ported from Go: deep keys, empty value, read-only failure.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn deeply_nested_key_resolves_correctly() {
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        let stage = stage_sysctl(&[("net.ipv4.tcp_syncookies", "1")]);
+        run(&stage, &fs, &console).unwrap();
+        let got = fs
+            .read_to_string(Path::new("/proc/sys/net/ipv4/tcp_syncookies"))
+            .unwrap();
+        assert_eq!(got, "1");
+    }
+
+    #[test]
+    fn empty_value_writes_empty_file() {
+        // Some sysctls accept the empty string to clear a value.
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        let stage = stage_sysctl(&[("net.ipv4.foo", "")]);
+        run(&stage, &fs, &console).unwrap();
+        let got = fs
+            .read_to_string(Path::new("/proc/sys/net/ipv4/foo"))
+            .unwrap();
+        assert_eq!(got, "");
+    }
+
+    #[test]
+    fn read_only_sysctl_path_failure_captured_in_multi() {
+        // Mock a read-only target — the write call returns an error, and the
+        // plugin should aggregate it into Error::Multi while still attempting
+        // siblings.
+        let fs = PartialFailVfs {
+            inner: MemVfs::new(),
+            fail_for: "readonly".to_string(),
+        };
+        let console = RecordingConsole::default();
+        let stage = stage_sysctl(&[
+            ("kernel.readonly_key", "x"),
+            ("kernel.normal_key", "y"),
+        ]);
+        let err = run(&stage, &fs, &console).unwrap_err();
+        match err {
+            Error::Multi(es) => assert_eq!(es.len(), 1, "exactly one failure"),
+            other => panic!("expected Multi, got {other:?}"),
+        }
+        // Sibling key still succeeded.
+        assert_eq!(
+            fs.inner
+                .read_to_string(Path::new("/proc/sys/kernel/normal_key"))
+                .unwrap(),
+            "y"
+        );
+    }
 }

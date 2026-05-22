@@ -265,4 +265,148 @@ mod tests {
         let out = check(&stage, &fs, &console).expect("check ok");
         assert_eq!(out, ConditionalOutcome::Run);
     }
+
+    // --- Additional tests ported from Go behaviour expectations ---
+
+    #[test]
+    fn mixed_any_all_none_all_passing_runs() {
+        // Nested mix of all three check types, every condition satisfied.
+        let fs = MemVfs::new();
+        fs.write(Path::new("/etc/hostname"), b"x").unwrap();
+        fs.write(Path::new("/etc/hosts"), b"x").unwrap();
+        // /etc/some-other present for `any`.
+        fs.write(Path::new("/etc/some-other"), b"x").unwrap();
+        // /etc/banned absent for `none`.
+
+        let mut m: IfFiles = IfFiles::new();
+        m.insert(
+            IfCheckType::All,
+            vec!["/etc/hostname".into(), "/etc/hosts".into()],
+        );
+        m.insert(
+            IfCheckType::Any,
+            vec!["/etc/some-other".into(), "/etc/nowhere".into()],
+        );
+        m.insert(IfCheckType::None, vec!["/etc/banned".into()]);
+        let stage = stage_with(m);
+
+        let console = RecordingConsole::new();
+        let out = check(&stage, &fs, &console).expect("check ok");
+        assert_eq!(out, ConditionalOutcome::Run);
+    }
+
+    #[test]
+    fn mixed_any_all_none_one_failing_skips() {
+        // All & Any satisfied, but None constraint fails because a
+        // "forbidden" file exists.
+        let fs = MemVfs::new();
+        fs.write(Path::new("/etc/hostname"), b"x").unwrap();
+        fs.write(Path::new("/etc/hosts"), b"x").unwrap();
+        fs.write(Path::new("/etc/some-other"), b"x").unwrap();
+        fs.write(Path::new("/etc/banned"), b"x").unwrap();
+
+        let mut m: IfFiles = IfFiles::new();
+        m.insert(
+            IfCheckType::All,
+            vec!["/etc/hostname".into(), "/etc/hosts".into()],
+        );
+        m.insert(
+            IfCheckType::Any,
+            vec!["/etc/some-other".into(), "/etc/nowhere".into()],
+        );
+        m.insert(IfCheckType::None, vec!["/etc/banned".into()]);
+        let stage = stage_with(m);
+
+        let console = RecordingConsole::new();
+        let out = check(&stage, &fs, &console).expect("check ok");
+        assert_eq!(out, ConditionalOutcome::Skip);
+    }
+
+    #[test]
+    fn trailing_slash_on_dir_path_is_handled() {
+        // Path written without trailing slash; the user supplies one.
+        let fs = MemVfs::new();
+        fs.mkdir_all(Path::new("/etc/some-dir")).unwrap();
+
+        let mut m: IfFiles = IfFiles::new();
+        m.insert(IfCheckType::All, vec!["/etc/some-dir/".to_string()]);
+        let stage = stage_with(m);
+
+        let console = RecordingConsole::new();
+        // MemVfs.exists with a trailing slash on a dir-existing path
+        // should still report true (Path::new("/etc/some-dir/") canonicalises
+        // to the same key). If this assertion fails the implementation may
+        // need a path-normalisation tweak — captured here as a known case.
+        let out = check(&stage, &fs, &console).expect("check ok");
+        assert_eq!(out, ConditionalOutcome::Run);
+    }
+
+    #[test]
+    fn all_three_present_with_one_of_three_any_missing_runs() {
+        // Any: one of three paths present is enough.
+        let fs = MemVfs::new();
+        fs.write(Path::new("/etc/c"), b"x").unwrap();
+
+        let mut m: IfFiles = IfFiles::new();
+        m.insert(
+            IfCheckType::Any,
+            vec![
+                "/etc/a".into(),
+                "/etc/b".into(),
+                "/etc/c".into(),
+            ],
+        );
+        let stage = stage_with(m);
+
+        let console = RecordingConsole::new();
+        let out = check(&stage, &fs, &console).expect("check ok");
+        assert_eq!(out, ConditionalOutcome::Run);
+    }
+
+    #[test]
+    fn all_kind_one_of_three_missing_skips() {
+        // All: any missing path causes skip; even if 2 of 3 exist.
+        let fs = MemVfs::new();
+        fs.write(Path::new("/etc/a"), b"x").unwrap();
+        fs.write(Path::new("/etc/b"), b"x").unwrap();
+        // /etc/c absent
+
+        let mut m: IfFiles = IfFiles::new();
+        m.insert(
+            IfCheckType::All,
+            vec![
+                "/etc/a".into(),
+                "/etc/b".into(),
+                "/etc/c".into(),
+            ],
+        );
+        let stage = stage_with(m);
+
+        let console = RecordingConsole::new();
+        let out = check(&stage, &fs, &console).expect("check ok");
+        assert_eq!(out, ConditionalOutcome::Skip);
+    }
+
+    #[test]
+    fn none_with_three_paths_one_present_skips() {
+        // None: all listed paths must be absent. A single present file
+        // is enough to skip.
+        let fs = MemVfs::new();
+        fs.write(Path::new("/etc/c"), b"x").unwrap();
+
+        let mut m: IfFiles = IfFiles::new();
+        m.insert(
+            IfCheckType::None,
+            vec![
+                "/etc/a".into(),
+                "/etc/b".into(),
+                "/etc/c".into(),
+            ],
+        );
+        let stage = stage_with(m);
+
+        let console = RecordingConsole::new();
+        let out = check(&stage, &fs, &console).expect("check ok");
+        assert_eq!(out, ConditionalOutcome::Skip);
+    }
 }

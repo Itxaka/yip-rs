@@ -229,4 +229,87 @@ mod tests {
             .expect("write");
         assert_eq!(run(&stage, &fs), ConditionalOutcome::Run);
     }
+
+    // --- Additional tests ported from Go behaviour expectations ---
+
+    #[test]
+    fn pre_release_version_matches_with_prefix_regex() {
+        // VERSION_ID values like "22.04-rc" are valid and should match
+        // a prefix-style anchor.
+        let stage = Stage {
+            only_if_os_version: r"^22\.04".into(),
+            ..Default::default()
+        };
+        let fs = fs_with_version("22.04-rc");
+        assert_eq!(run(&stage, &fs), ConditionalOutcome::Run);
+    }
+
+    #[test]
+    fn pre_release_version_skipped_by_exact_anchor() {
+        // An anchored exact regex must NOT match a pre-release suffix.
+        let stage = Stage {
+            only_if_os_version: r"^22\.04$".into(),
+            ..Default::default()
+        };
+        let fs = fs_with_version("22.04-rc");
+        assert_eq!(run(&stage, &fs), ConditionalOutcome::Skip);
+    }
+
+    #[test]
+    fn version_field_is_not_used_only_version_id() {
+        // Per the Rust port spec, we read VERSION_ID — not VERSION.
+        // A file that only has VERSION should therefore Skip.
+        let stage = Stage {
+            only_if_os_version: "22.04".into(),
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        fs.write(
+            Path::new("/etc/os-release"),
+            b"NAME=\"Ubuntu\"\nVERSION=\"22.04 LTS\"\n",
+        )
+        .expect("write");
+        assert_eq!(run(&stage, &fs), ConditionalOutcome::Skip);
+    }
+
+    #[test]
+    fn cpe_name_field_is_ignored() {
+        // CPE_NAME contains a version string in its CPE URI but we explicitly
+        // only inspect VERSION_ID, not the CPE field.
+        let stage = Stage {
+            only_if_os_version: "22.04".into(),
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        fs.write(
+            Path::new("/etc/os-release"),
+            b"NAME=\"Ubuntu\"\nCPE_NAME=\"cpe:/o:canonical:ubuntu_linux:22.04\"\n",
+        )
+        .expect("write");
+        // No VERSION_ID -> Skip.
+        assert_eq!(run(&stage, &fs), ConditionalOutcome::Skip);
+    }
+
+    #[test]
+    fn weird_pattern_skips_on_real_versions() {
+        // Direct port of the Go test which configures
+        // `only_if_os_version: "weird"` — must Skip on a normal version.
+        let stage = Stage {
+            only_if_os_version: "weird".into(),
+            ..Default::default()
+        };
+        let fs = fs_with_version("22.04");
+        assert_eq!(run(&stage, &fs), ConditionalOutcome::Skip);
+    }
+
+    #[test]
+    fn version_id_with_pre_release_underscore() {
+        // Some distros (rolling) emit suffixes like 22.04_rc1.
+        let stage = Stage {
+            only_if_os_version: r"^22\.".into(),
+            ..Default::default()
+        };
+        let fs = fs_with_version("22.04_rc1");
+        assert_eq!(run(&stage, &fs), ConditionalOutcome::Run);
+    }
 }

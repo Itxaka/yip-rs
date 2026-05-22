@@ -154,4 +154,114 @@ mod tests {
         let out = check(&stage, &fs, &console).expect("check ok");
         assert_eq!(out, ConditionalOutcome::Skip);
     }
+
+    // --- Additional tests ported from Go behaviour expectations ---
+
+    /// Override the HOSTNAME env var for the scope of a closure so we can
+    /// drive the regex matcher with a deterministic hostname. The test path
+    /// in `current_hostname()` checks this env var before falling back to
+    /// `gethostname`, so we exercise the same code path as a real host with
+    /// the given hostname.
+    fn with_env_hostname<R>(name: &str, f: impl FnOnce() -> R) -> R {
+        let prev = std::env::var("HOSTNAME").ok();
+        std::env::set_var("HOSTNAME", name);
+        let out = f();
+        match prev {
+            Some(p) => std::env::set_var("HOSTNAME", p),
+            None => std::env::remove_var("HOSTNAME"),
+        }
+        out
+    }
+
+    #[test]
+    fn regex_with_special_chars_matches_hostname() {
+        with_env_hostname("web-42", || {
+            let stage = Stage {
+                // Pattern uses regex character class + quantifier — must
+                // partial-match against the hostname.
+                node: "web-[0-9]+".to_string(),
+                ..Default::default()
+            };
+            let fs = RealVfs::new();
+            let console = RecordingConsole::new();
+            let out = check(&stage, &fs, &console).expect("check ok");
+            assert_eq!(out, ConditionalOutcome::Run);
+        });
+    }
+
+    #[test]
+    fn regex_with_special_chars_skips_unrelated_hostname() {
+        with_env_hostname("dbserver01", || {
+            let stage = Stage {
+                node: "web-[0-9]+".to_string(),
+                ..Default::default()
+            };
+            let fs = RealVfs::new();
+            let console = RecordingConsole::new();
+            let out = check(&stage, &fs, &console).expect("check ok");
+            assert_eq!(out, ConditionalOutcome::Skip);
+        });
+    }
+
+    #[test]
+    fn partial_match_in_hostname_runs() {
+        // Hostname has more characters than the regex — `is_match` is
+        // unanchored so a partial match should succeed.
+        with_env_hostname("kube-node-3.prod.internal", || {
+            let stage = Stage {
+                node: "kube-node".to_string(),
+                ..Default::default()
+            };
+            let fs = RealVfs::new();
+            let console = RecordingConsole::new();
+            let out = check(&stage, &fs, &console).expect("check ok");
+            assert_eq!(out, ConditionalOutcome::Run);
+        });
+    }
+
+    #[test]
+    fn anchored_regex_against_partial_string_skips() {
+        // Anchors force a full match.
+        with_env_hostname("kube-node-3.prod.internal", || {
+            let stage = Stage {
+                node: "^kube-node$".to_string(),
+                ..Default::default()
+            };
+            let fs = RealVfs::new();
+            let console = RecordingConsole::new();
+            let out = check(&stage, &fs, &console).expect("check ok");
+            assert_eq!(out, ConditionalOutcome::Skip);
+        });
+    }
+
+    #[test]
+    fn whitespace_in_node_field_is_treated_literally() {
+        // Leading/trailing whitespace in the configured `node` field is
+        // NOT stripped — it's part of the regex. Against a normal hostname
+        // those literal spaces won't match, so we expect Skip.
+        with_env_hostname("worker-1", || {
+            let stage = Stage {
+                node: "  worker-1  ".to_string(),
+                ..Default::default()
+            };
+            let fs = RealVfs::new();
+            let console = RecordingConsole::new();
+            let out = check(&stage, &fs, &console).expect("check ok");
+            assert_eq!(out, ConditionalOutcome::Skip);
+        });
+    }
+
+    #[test]
+    fn alternation_matches_one_branch() {
+        with_env_hostname("staging-1", || {
+            let stage = Stage {
+                node: "(staging|prod)-[0-9]+".to_string(),
+                ..Default::default()
+            };
+            let fs = RealVfs::new();
+            let console = RecordingConsole::new();
+            let out = check(&stage, &fs, &console).expect("check ok");
+            assert_eq!(out, ConditionalOutcome::Run);
+        });
+    }
 }

@@ -1,6 +1,39 @@
-//! `Stage` is the unit of work executed by yip's plugins. One stage in YAML
-//! maps to one `Stage` struct. All 24 fields are optional — every missing
-//! YAML key parses to its default value.
+//! [`Stage`] — the unit of work executed by yip's plugins.
+//!
+//! One YAML stage entry maps to one [`Stage`] struct. All fields are
+//! optional; every missing YAML key parses to its default value. When the
+//! executor walks a config it runs the registered plugin chain against
+//! each stage in turn, with each plugin only acting on the field it cares
+//! about (e.g. the `files` plugin only inspects [`Stage::files`]).
+//!
+//! ## YAML key mapping
+//!
+//! Field names in this struct are Rust-idiomatic snake_case. YAML keys
+//! occasionally differ (older yip naming): see the per-field docs below.
+//! The most common renames are:
+//!
+//! - [`Stage::ssh_keys`] ↔ YAML `authorized_keys`
+//! - [`Stage::data_sources`] ↔ YAML `datasource`
+//! - [`Stage::only_if_os`] ↔ YAML `only_os`
+//! - [`Stage::only_if_arch`] ↔ YAML `only_arch`
+//! - [`Stage::only_if_os_version`] ↔ YAML `only_os_version`
+//! - [`Stage::only_if_service_manager`] ↔ YAML `only_service_manager`
+//!
+//! # Examples
+//!
+//! ```
+//! use yip::schema::Stage;
+//!
+//! let y = "name: hello\ncommands: [echo hi]\n";
+//! let s: Stage = serde_yaml::from_str(y).unwrap();
+//! assert_eq!(s.name, "hello");
+//! assert_eq!(s.commands, vec!["echo hi".to_string()]);
+//! ```
+//!
+//! # Stability
+//!
+//! Public API. Field set matches Go yip; adding a new YAML key requires
+//! adding a new field here.
 
 use std::collections::HashMap;
 
@@ -17,33 +50,73 @@ use crate::schema::systemctl::Systemctl;
 use crate::schema::unpack::UnpackImageConf;
 use crate::schema::user::{User, YipEntity};
 
+/// A pointer to another stage by name, used in `after:` lists.
+///
+/// Modelled as a struct (rather than a bare string) to match Go's YAML
+/// layout — `after: [{name: foo}]` rather than `after: [foo]`.
+///
+/// # Examples
+///
+/// ```
+/// use yip::schema::Dependency;
+///
+/// let d = Dependency { name: "other".into() };
+/// assert_eq!(d.name, "other");
+/// ```
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Dependency {
+    /// Name of the stage this entry depends on. YAML key: `name`.
     #[serde(default, rename = "name", skip_serializing_if = "String::is_empty")]
     pub name: String,
 }
 
+/// A single stage entry — the smallest unit of yip work.
+///
+/// Every field is optional; an empty `Stage {}` is valid and is a
+/// silent no-op when the executor runs it.
+///
+/// # Examples
+///
+/// ```
+/// use yip::schema::Stage;
+///
+/// let s = Stage { name: "demo".into(), ..Default::default() };
+/// assert_eq!(s.name, "demo");
+/// assert!(s.commands.is_empty());
+/// ```
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Stage {
     // --- core file/command actions ---
+    /// Shell commands run by the `commands` plugin, in order. YAML key:
+    /// `commands`.
     #[serde(default, rename = "commands", skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<String>,
+    /// Files to write (path, content, permissions, …). YAML key: `files`.
     #[serde(default, rename = "files", skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<File>,
+    /// Files to fetch over HTTP(S). YAML key: `downloads`.
     #[serde(default, rename = "downloads", skip_serializing_if = "Vec::is_empty")]
     pub downloads: Vec<Download>,
+    /// Directories to ensure exist (with mode/owner). YAML key:
+    /// `directories`.
     #[serde(default, rename = "directories", skip_serializing_if = "Vec::is_empty")]
     pub directories: Vec<Directory>,
+    /// Inline shell expression evaluated by the `if` conditional —
+    /// non-empty + exit 0 ⇒ run the stage. YAML key: `if`.
     #[serde(default, rename = "if", skip_serializing_if = "String::is_empty")]
     pub r#if: String,
 
     // --- entity / passwd-style ---
+    /// Linux user/group/sudoers entries to create. YAML key:
+    /// `ensure_entities`.
     #[serde(
         default,
         rename = "ensure_entities",
         skip_serializing_if = "Vec::is_empty"
     )]
     pub ensure_entities: Vec<YipEntity>,
+    /// Linux user/group/sudoers entries to delete. YAML key:
+    /// `delete_entities`.
     #[serde(
         default,
         rename = "delete_entities",
@@ -52,16 +125,22 @@ pub struct Stage {
     pub delete_entities: Vec<YipEntity>,
 
     // --- networking / identity ---
+    /// DNS resolver configuration. YAML key: `dns`.
     #[serde(default, rename = "dns", skip_serializing_if = "dns_is_default")]
     pub dns: DNS,
+    /// Hostname to set. YAML key: `hostname`.
     #[serde(default, rename = "hostname", skip_serializing_if = "String::is_empty")]
     pub hostname: String,
+    /// Stage name (used for logging + DAG dependency wiring). YAML key:
+    /// `name`.
     #[serde(default, rename = "name", skip_serializing_if = "String::is_empty")]
     pub name: String,
+    /// `sysctl` key/value pairs. YAML key: `sysctl`.
     #[serde(default, rename = "sysctl", skip_serializing_if = "HashMap::is_empty")]
     pub sysctl: HashMap<String, String>,
 
-    /// `SSHKeys` in Go — YAML key `authorized_keys`.
+    /// Authorised SSH keys per user. Maps `user → [keys]`. `SSHKeys` in
+    /// Go. YAML key: `authorized_keys`.
     #[serde(
         default,
         rename = "authorized_keys",
@@ -69,22 +148,32 @@ pub struct Stage {
     )]
     pub ssh_keys: HashMap<String, Vec<String>>,
 
+    /// `node` conditional value — only run if the local hostname
+    /// matches. YAML key: `node`.
     #[serde(default, rename = "node", skip_serializing_if = "String::is_empty")]
     pub node: String,
+    /// User accounts to create/update. Maps `username → User`. YAML
+    /// key: `users`.
     #[serde(default, rename = "users", skip_serializing_if = "HashMap::is_empty")]
     pub users: HashMap<String, User>,
+    /// Kernel modules to load. YAML key: `modules`.
     #[serde(default, rename = "modules", skip_serializing_if = "Vec::is_empty")]
     pub modules: Vec<String>,
 
+    /// systemd unit enable/disable/mask actions. YAML key: `systemctl`.
     #[serde(default, rename = "systemctl", skip_serializing_if = "systemctl_is_default")]
     pub systemctl: Systemctl,
 
+    /// Global environment variables to write to `/etc/environment`. YAML
+    /// key: `environment`.
     #[serde(
         default,
         rename = "environment",
         skip_serializing_if = "HashMap::is_empty"
     )]
     pub environment: HashMap<String, String>,
+    /// Alternative file to write `environment` into. YAML key:
+    /// `environment_file`.
     #[serde(
         default,
         rename = "environment_file",
@@ -92,6 +181,8 @@ pub struct Stage {
     )]
     pub environment_file: String,
 
+    /// Pinned package versions for the package manager. YAML key:
+    /// `package_pins`.
     #[serde(
         default,
         rename = "package_pins",
@@ -99,9 +190,12 @@ pub struct Stage {
     )]
     pub package_pins: PackagePins,
 
+    /// Packages to install / remove / refresh / upgrade. YAML key:
+    /// `packages`.
     #[serde(default, rename = "packages", skip_serializing_if = "packages_is_default")]
     pub packages: Packages,
 
+    /// OCI / tar images to unpack onto disk. YAML key: `unpack_images`.
     #[serde(
         default,
         rename = "unpack_images",
@@ -110,16 +204,22 @@ pub struct Stage {
     pub unpack_images: Vec<UnpackImageConf>,
 
     // --- dependency wiring ---
+    /// DAG dependencies — this stage runs after the named stages. YAML
+    /// key: `after`.
     #[serde(default, rename = "after", skip_serializing_if = "Vec::is_empty")]
     pub after: Vec<Dependency>,
 
-    /// `DataSources` in Go — YAML key `datasource`.
+    /// Cloud datasource probe config. `DataSources` in Go. YAML key:
+    /// `datasource`.
     #[serde(default, rename = "datasource", skip_serializing_if = "datasource_is_default")]
     pub data_sources: DataSource,
 
+    /// Disk / partition / filesystem layout. YAML key: `layout`.
     #[serde(default, rename = "layout", skip_serializing_if = "layout_is_default")]
     pub layout: Layout,
 
+    /// `systemd-firstboot` parameters (timezone, locale, …). YAML key:
+    /// `systemd_firstboot`.
     #[serde(
         default,
         rename = "systemd_firstboot",
@@ -127,6 +227,8 @@ pub struct Stage {
     )]
     pub systemd_firstboot: HashMap<String, String>,
 
+    /// `systemd-timesyncd` config (NTP server list, …). YAML key:
+    /// `timesyncd`.
     #[serde(
         default,
         rename = "timesyncd",
@@ -134,26 +236,36 @@ pub struct Stage {
     )]
     pub timesyncd: HashMap<String, String>,
 
+    /// Git checkout to perform. YAML key: `git`.
     #[serde(default, rename = "git", skip_serializing_if = "git_is_default")]
     pub git: Git,
 
     // --- conditionals ---
+    /// Gate the stage on `os-release` ID. YAML key: `only_os`.
     #[serde(default, rename = "only_os", skip_serializing_if = "String::is_empty")]
     pub only_if_os: String,
+    /// Gate the stage on `os-release` VERSION_ID. YAML key:
+    /// `only_os_version`.
     #[serde(
         default,
         rename = "only_os_version",
         skip_serializing_if = "String::is_empty"
     )]
     pub only_if_os_version: String,
+    /// Gate the stage on machine architecture (`amd64` / `arm64` / …).
+    /// YAML key: `only_arch`.
     #[serde(default, rename = "only_arch", skip_serializing_if = "String::is_empty")]
     pub only_if_arch: String,
+    /// Gate the stage on init system (`systemd` / `openrc` / …). YAML
+    /// key: `only_service_manager`.
     #[serde(
         default,
         rename = "only_service_manager",
         skip_serializing_if = "String::is_empty"
     )]
     pub only_if_service_manager: String,
+    /// Gate the stage on file existence (any / all / none semantics
+    /// depending on the inner map). YAML key: `if_files`.
     #[serde(default, rename = "if_files", skip_serializing_if = "HashMap::is_empty")]
     pub if_files: IfFiles,
 }

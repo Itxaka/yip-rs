@@ -207,4 +207,108 @@ mod tests {
             "nameserver 9.9.9.9\n"
         );
     }
+
+    // -------------------------------------------------------------------
+    // Ported from Go: multiple search/options, IPv6, custom path.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn multiple_search_domains_joined_with_space() {
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        let stage = stage_with_dns(DNS {
+            nameservers: vec!["8.8.8.8".into()],
+            dns_search: vec![
+                "corp.example".into(),
+                "dev.example".into(),
+                "staging.example".into(),
+            ],
+            ..Default::default()
+        });
+        run(&stage, &fs, &console).unwrap();
+        let got = fs.read_to_string(Path::new(DEFAULT_RESOLV_CONF)).unwrap();
+        let search_line = got
+            .lines()
+            .find(|l| l.starts_with("search "))
+            .expect("search line");
+        assert_eq!(search_line, "search corp.example dev.example staging.example");
+    }
+
+    #[test]
+    fn multiple_options_joined_with_space() {
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        let stage = stage_with_dns(DNS {
+            nameservers: vec!["8.8.8.8".into()],
+            dns_options: vec![
+                "ndots:1".into(),
+                "timeout:2".into(),
+                "attempts:3".into(),
+                "rotate".into(),
+            ],
+            ..Default::default()
+        });
+        run(&stage, &fs, &console).unwrap();
+        let got = fs.read_to_string(Path::new(DEFAULT_RESOLV_CONF)).unwrap();
+        let opt_line = got
+            .lines()
+            .find(|l| l.starts_with("options "))
+            .expect("options line");
+        assert_eq!(opt_line, "options ndots:1 timeout:2 attempts:3 rotate");
+    }
+
+    #[test]
+    fn combined_nameservers_search_options_full_layout() {
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        let stage = stage_with_dns(DNS {
+            nameservers: vec!["8.8.8.8".into(), "8.8.4.4".into()],
+            dns_search: vec!["example.com".into(), "example.org".into()],
+            dns_options: vec!["ndots:2".into(), "rotate".into()],
+            ..Default::default()
+        });
+        run(&stage, &fs, &console).unwrap();
+        let got = fs.read_to_string(Path::new(DEFAULT_RESOLV_CONF)).unwrap();
+        assert_eq!(
+            got,
+            "search example.com example.org\n\
+             nameserver 8.8.8.8\n\
+             nameserver 8.8.4.4\n\
+             options ndots:2 rotate\n"
+        );
+    }
+
+    #[test]
+    fn ipv6_nameserver_written_unchanged() {
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        let stage = stage_with_dns(DNS {
+            nameservers: vec!["2001:4860:4860::8888".into(), "fe80::1%eth0".into()],
+            ..Default::default()
+        });
+        run(&stage, &fs, &console).unwrap();
+        let got = fs.read_to_string(Path::new(DEFAULT_RESOLV_CONF)).unwrap();
+        assert!(got.contains("nameserver 2001:4860:4860::8888\n"));
+        assert!(got.contains("nameserver fe80::1%eth0\n"));
+    }
+
+    #[test]
+    fn custom_path_override_keeps_default_untouched() {
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        let stage = stage_with_dns(DNS {
+            nameservers: vec!["1.1.1.1".into()],
+            dns_search: vec!["x.example".into()],
+            dns_options: vec!["timeout:1".into()],
+            path: "/tmp/resolv-custom".into(),
+            ..Default::default()
+        });
+        run(&stage, &fs, &console).unwrap();
+        assert!(!fs.exists(Path::new(DEFAULT_RESOLV_CONF)));
+        let got = fs.read_to_string(Path::new("/tmp/resolv-custom")).unwrap();
+        assert_eq!(
+            got,
+            "search x.example\nnameserver 1.1.1.1\noptions timeout:1\n"
+        );
+    }
 }

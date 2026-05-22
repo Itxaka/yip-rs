@@ -1,9 +1,50 @@
-//! Port of `pkg/console/console.go` plus the `plugins.Console` interface
-//! from `pkg/plugins/common.go` (lines 27-31).
+//! Subprocess execution abstraction.
 //!
-//! The trait abstracts subprocess execution so plugins can shell out on
-//! real hosts while tests inject a `RecordingConsole` that captures
-//! invocations without running anything.
+//! Plugins that need to shell out (run `systemctl`, `useradd`, `git`, …)
+//! do so through the [`Console`] trait. The production impl
+//! [`StandardConsole`] forwards to `/bin/sh -c`; the test mock
+//! [`RecordingConsole`] captures every call without executing anything
+//! and lets tests install per-command canned responses.
+//!
+//! This module ports `pkg/console/console.go` plus the `plugins.Console`
+//! interface from `pkg/plugins/common.go` (lines 27-31) of the upstream
+//! Go yip.
+//!
+//! ## When to use which
+//!
+//! - **Production code / the binary**: [`StandardConsole`].
+//! - **Tests**: [`RecordingConsole`] — assert on
+//!   [`RecordingConsole::commands()`] to verify behaviour, install
+//!   [`RecordingConsole::expect()`] entries for commands that should
+//!   return something specific.
+//! - **Custom impl**: implement the trait yourself if you need
+//!   sandboxing, tracing, dry-run behaviour, etc.
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use yip::console::{Console, StandardConsole};
+//!
+//! let c = StandardConsole::new();
+//! let out = c.run("echo hello").unwrap();
+//! assert!(out.contains("hello"));
+//! ```
+//!
+//! Test mock:
+//!
+//! ```
+//! use yip::console::{Console, RecordingConsole};
+//!
+//! let c = RecordingConsole::new();
+//! c.expect("uname -s", Ok("Linux".into()));
+//! assert_eq!(c.run("uname -s").unwrap(), "Linux");
+//! assert_eq!(c.commands(), vec!["uname -s".to_string()]);
+//! ```
+//!
+//! # Stability
+//!
+//! Public API. Adding methods to [`Console`] without a default impl is a
+//! breaking change for downstream impls.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -12,24 +53,57 @@ use std::sync::Mutex;
 
 use crate::error::{Error, Result};
 
-/// Abstraction over subprocess execution. Lets plugins shell out for
-/// real on production hosts while staying mockable in tests.
+/// Abstraction over subprocess execution.
 ///
-/// Ports the Go `plugins.Console` interface from `pkg/plugins/common.go`.
+/// Lets plugins shell out for real on production hosts while staying
+/// mockable in tests. Ports the Go `plugins.Console` interface from
+/// `pkg/plugins/common.go`.
+///
+/// All methods are `&self` so a single console can be shared across
+/// threads; impls must be `Send + Sync`.
+///
+/// # Examples
+///
+/// ```
+/// use yip::console::{Console, RecordingConsole};
+///
+/// let c = RecordingConsole::new();
+/// c.run("ls").unwrap();
+/// assert_eq!(c.commands(), vec!["ls".to_string()]);
+/// ```
 pub trait Console: Send + Sync {
-    /// Run a shell command. The command is passed verbatim to `/bin/sh -c`
-    /// (same as Go's `exec.Command("sh", "-c", cmd)`). Returns combined
-    /// stdout+stderr as a `String`. Errors when the exit code is non-zero.
+    /// Run a shell command.
+    ///
+    /// The command is passed verbatim to `/bin/sh -c` (same as Go's
+    /// `exec.Command("sh", "-c", cmd)`). Returns combined stdout+stderr
+    /// as a `String`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Cmd`] when the exit code is non-zero, the
+    /// process can't be spawned, or output isn't valid UTF-8.
     fn run(&self, cmd: &str) -> Result<String>;
 
-    /// Run a shell command in a specific working directory. Same semantics
-    /// as [`Console::run`] but with the child's cwd set to `cwd`.
+    /// Run a shell command in a specific working directory.
+    ///
+    /// Same semantics as [`Console::run`] but with the child's cwd set
+    /// to `cwd`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Console::run`].
     fn run_in(&self, cwd: &Path, cmd: &str) -> Result<String>;
 
     /// Spawn a command and return its [`Output`] for callers that need
-    /// separate stdout/stderr handles. Most plugins use [`Console::run`]
-    /// instead. The default impl delegates to `run` and stuffs the
-    /// combined output into `stdout`.
+    /// separate stdout/stderr handles.
+    ///
+    /// Most plugins use [`Console::run`] instead. The default impl
+    /// delegates to [`Console::run`] and stuffs the combined output
+    /// into `stdout` with an empty `stderr`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Console::run`].
     fn run_with_output(&self, cmd: &str) -> Result<Output> {
         use std::os::unix::process::ExitStatusExt;
         let combined = self.run(cmd)?;
@@ -40,13 +114,35 @@ pub trait Console: Send + Sync {
         })
     }
 
-    /// Run a list of commands as a templated unit. Mirrors Go
-    /// `Console.RunTemplate([]string, string)`. The `template` arg is a
-    /// printf-style format string with a single `%s` marker (matches Go's
-    /// `fmt.Sprintf(template, svc)`); each entry in `cmds` is substituted
-    /// in turn and the resulting command run through [`Console::run`].
+    /// Run a list of commands as a templated unit.
+    ///
+    /// Mirrors Go `Console.RunTemplate([]string, string)`. The `template`
+    /// arg is a printf-style format string with a single `%s` marker
+    /// (matches Go's `fmt.Sprintf(template, svc)`); each entry in `cmds`
+    /// is substituted in turn and the resulting command run through
+    /// [`Console::run`].
+    ///
+    /// # Errors
+    ///
     /// Errors from individual commands are collected and returned as
-    /// [`Error::Multi`] (mirrors Go's `multierror.Append`).
+    /// [`Error::Multi`] (mirrors Go's `multierror.Append`). Empty `cmds`
+    /// always succeeds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use yip::console::{Console, RecordingConsole};
+    ///
+    /// let c = RecordingConsole::new();
+    /// c.run_template(
+    ///     &["sshd".into(), "cron".into()],
+    ///     "systemctl enable %s",
+    /// ).unwrap();
+    /// assert_eq!(
+    ///     c.commands(),
+    ///     vec!["systemctl enable sshd".to_string(), "systemctl enable cron".to_string()],
+    /// );
+    /// ```
     fn run_template(&self, cmds: &[String], template: &str) -> Result<()> {
         let mut errs: Vec<Error> = Vec::new();
         for svc in cmds {
@@ -91,10 +187,32 @@ fn render_printf(template: &str, arg: &str) -> String {
     out
 }
 
-/// Production impl. Shells out to `/bin/sh -c` (matching Go behaviour).
+/// Production [`Console`] impl that shells out to `/bin/sh -c`.
+///
+/// Errors on non-zero exit. Combined stdout+stderr is returned by
+/// [`Console::run`] (matches Go's `CombinedOutput`).
+///
+/// # Examples
+///
+/// ```no_run
+/// use yip::console::{Console, StandardConsole};
+///
+/// let c = StandardConsole::new();
+/// let out = c.run("uname -s").unwrap();
+/// assert!(!out.is_empty());
+/// ```
 pub struct StandardConsole;
 
 impl StandardConsole {
+    /// Construct a new `StandardConsole`. Zero-sized — equivalent to
+    /// [`StandardConsole::default`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use yip::console::StandardConsole;
+    /// let _ = StandardConsole::new();
+    /// ```
     pub fn new() -> Self {
         Self
     }
@@ -167,10 +285,28 @@ impl Console for StandardConsole {
     }
 }
 
-/// One recorded `run` / `run_in` invocation.
+/// One recorded [`Console::run`] / [`Console::run_in`] invocation,
+/// captured by [`RecordingConsole`].
+///
+/// # Examples
+///
+/// ```
+/// use yip::console::{Console, RecordedCall, RecordingConsole};
+///
+/// let c = RecordingConsole::new();
+/// c.run("ls").unwrap();
+/// let calls: Vec<RecordedCall> = c.calls();
+/// assert_eq!(calls[0].cmd, "ls");
+/// assert!(calls[0].cwd.is_none());
+/// ```
 #[derive(Debug, Clone)]
 pub struct RecordedCall {
+    /// The shell command that was passed in. Verbatim — no quoting or
+    /// substitution has been done.
     pub cmd: String,
+    /// Working directory the command was supposed to run in. `None`
+    /// means [`Console::run`] was used (cwd unspecified); `Some` means
+    /// [`Console::run_in`] was used.
     pub cwd: Option<PathBuf>,
 }
 
@@ -179,16 +315,41 @@ struct RecordingState {
     responses: HashMap<String, std::result::Result<String, String>>,
 }
 
-/// Test-only mock. Records every `run` call without executing anything.
-/// Returns a configurable canned response (default empty string, success).
+/// Test-only [`Console`] mock that records every call without executing
+/// anything.
 ///
-/// Has helper methods for tests to inspect what got recorded and to
-/// install per-command canned responses.
+/// Returns a configurable canned response (default empty string,
+/// success). Has helper methods for tests to inspect what got recorded
+/// and to install per-command canned responses with
+/// [`RecordingConsole::expect`].
+///
+/// # Examples
+///
+/// ```
+/// use yip::console::{Console, RecordingConsole};
+///
+/// let c = RecordingConsole::new();
+/// c.expect("uname", Ok("Linux".into()));
+/// assert_eq!(c.run("uname").unwrap(), "Linux");
+/// // Unknown commands fall back to empty success.
+/// assert_eq!(c.run("ls").unwrap(), "");
+/// assert_eq!(c.commands().len(), 2);
+/// ```
 pub struct RecordingConsole {
     inner: Mutex<RecordingState>,
 }
 
 impl RecordingConsole {
+    /// Construct a new empty `RecordingConsole`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use yip::console::RecordingConsole;
+    ///
+    /// let c = RecordingConsole::new();
+    /// assert!(c.commands().is_empty());
+    /// ```
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(RecordingState {
@@ -198,20 +359,71 @@ impl RecordingConsole {
         }
     }
 
-    /// Install a canned response for an exact command string. Subsequent
-    /// matching calls return this instead of an empty success.
+    /// Install a canned response for an exact command string.
+    ///
+    /// Subsequent matching calls return this instead of an empty
+    /// success. The response is `Ok(stdout)` for success or
+    /// `Err(stderr)` to simulate a non-zero exit (status code is 1).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use yip::console::{Console, RecordingConsole};
+    /// use yip::error::Error;
+    ///
+    /// let c = RecordingConsole::new();
+    /// c.expect("false", Err("boom".into()));
+    /// let err = c.run("false").unwrap_err();
+    /// assert!(matches!(err, Error::Cmd { .. }));
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex was poisoned by a previous panic in
+    /// another thread.
     pub fn expect(&self, cmd: impl Into<String>, response: std::result::Result<String, String>) {
         let mut state = self.inner.lock().expect("RecordingConsole mutex poisoned");
         state.responses.insert(cmd.into(), response);
     }
 
     /// Returns the list of calls recorded so far, in order.
+    ///
+    /// Each entry is a clone of the [`RecordedCall`] — calling this
+    /// does not drain the buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use yip::console::{Console, RecordingConsole};
+    ///
+    /// let c = RecordingConsole::new();
+    /// c.run("one").unwrap();
+    /// c.run("two").unwrap();
+    /// assert_eq!(c.calls().len(), 2);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex was poisoned.
     pub fn calls(&self) -> Vec<RecordedCall> {
         let state = self.inner.lock().expect("RecordingConsole mutex poisoned");
         state.calls.clone()
     }
 
     /// Convenience: returns just the command strings.
+    ///
+    /// Equivalent to `self.calls().into_iter().map(|c| c.cmd).collect()`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use yip::console::{Console, RecordingConsole};
+    ///
+    /// let c = RecordingConsole::new();
+    /// c.run("echo a").unwrap();
+    /// c.run("echo b").unwrap();
+    /// assert_eq!(c.commands(), vec!["echo a".to_string(), "echo b".to_string()]);
+    /// ```
     pub fn commands(&self) -> Vec<String> {
         self.calls().into_iter().map(|c| c.cmd).collect()
     }

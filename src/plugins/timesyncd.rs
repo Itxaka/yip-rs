@@ -139,4 +139,69 @@ mod tests {
         // 1 header line + 2 key=value lines + trailing newline.
         assert_eq!(content.lines().count(), 3);
     }
+
+    // -------------------------------------------------------------------
+    // Ported from Go: multi-line config rendering, empty-section no-write.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn multi_line_config_renders_each_key_on_its_own_line() {
+        let mut m = HashMap::new();
+        m.insert("NTP".into(), "0.pool.example".into());
+        m.insert("FallbackNTP".into(), "1.pool.example 2.pool.example".into());
+        m.insert("PollIntervalMaxSec".into(), "2048".into());
+        m.insert("PollIntervalMinSec".into(), "32".into());
+        m.insert("RootDistanceMaxSec".into(), "5".into());
+        let stage = Stage {
+            timesyncd: m,
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        run(&stage, &fs, &console).expect("ok");
+        let content = fs.read_to_string(Path::new(TIMESYNCD_CONF)).unwrap();
+        // 1 header + 5 keys + trailing newline -> 6 lines.
+        assert_eq!(content.lines().count(), 6);
+        // Alphabetical key order.
+        let expected = "[Time]\n\
+                        FallbackNTP=1.pool.example 2.pool.example\n\
+                        NTP=0.pool.example\n\
+                        PollIntervalMaxSec=2048\n\
+                        PollIntervalMinSec=32\n\
+                        RootDistanceMaxSec=5\n";
+        assert_eq!(content, expected);
+    }
+
+    #[test]
+    fn empty_time_section_does_not_create_file_even_if_dir_exists() {
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        // Pre-create the parent dir to make sure absence of file is purely
+        // due to empty map, not an mkdir failure.
+        fs.mkdir_all(Path::new("/etc/systemd")).unwrap();
+        let stage = Stage {
+            timesyncd: HashMap::new(),
+            ..Default::default()
+        };
+        run(&stage, &fs, &console).expect("ok");
+        assert!(!fs.exists(Path::new(TIMESYNCD_CONF)));
+    }
+
+    #[test]
+    fn single_ntp_entry_matches_go_default_test() {
+        // Mirrors the Go timesyncd_test "configures timesyncd" case (a single
+        // NTP pool entry). Sanity-check that the simplest config produces
+        // exactly the [Time] header plus one key=value line.
+        let mut m = HashMap::new();
+        m.insert("NTP".into(), "0.pool".into());
+        let stage = Stage {
+            timesyncd: m,
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        run(&stage, &fs, &console).expect("ok");
+        let content = fs.read_to_string(Path::new(TIMESYNCD_CONF)).unwrap();
+        assert_eq!(content, "[Time]\nNTP=0.pool\n");
+    }
 }

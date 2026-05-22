@@ -246,4 +246,97 @@ mod tests {
         };
         assert_eq!(run(&stage, &vfs), ConditionalOutcome::Run);
     }
+
+    // --- Additional tests ported from Go behaviour expectations ---
+
+    #[test]
+    fn id_like_field_does_not_satisfy_only_if_os_name_match() {
+        // Per the Rust port spec, OnlyIfOS only inspects NAME (not ID_LIKE).
+        // A regex matching only the ID_LIKE token should therefore Skip.
+        let vfs = MemVfs::new();
+        write_os_release(
+            &vfs,
+            "NAME=\"Rocky Linux\"\nID=rocky\nID_LIKE=\"rhel centos fedora\"\n",
+        );
+        // Pattern targets the ID_LIKE family name only — NAME is "Rocky
+        // Linux", so this must Skip.
+        let stage = Stage {
+            only_if_os: "^fedora$".into(),
+            ..Default::default()
+        };
+        assert_eq!(run(&stage, &vfs), ConditionalOutcome::Skip);
+    }
+
+    #[test]
+    fn id_like_token_inside_name_runs() {
+        // If the ID_LIKE token genuinely appears inside NAME (e.g. NAME
+        // contains "Fedora"), the unanchored regex matches.
+        let vfs = MemVfs::new();
+        write_os_release(
+            &vfs,
+            "NAME=\"Fedora Linux\"\nID=fedora\nID_LIKE=\"rhel\"\n",
+        );
+        let stage = Stage {
+            only_if_os: "fedora".into(),
+            ..Default::default()
+        };
+        // Note: NAME=Fedora Linux contains "Fedora" but the regex "fedora"
+        // would only match if regex is case-insensitive. By default it's
+        // case-sensitive, so use a case-insensitive flag instead.
+        let stage_ci = Stage {
+            only_if_os: "(?i)fedora".into(),
+            ..stage
+        };
+        assert_eq!(run(&stage_ci, &vfs), ConditionalOutcome::Run);
+    }
+
+    #[test]
+    fn multi_line_quoted_name_with_other_fields() {
+        // NAME comes after a few other fields. Parser must still pick it.
+        let vfs = MemVfs::new();
+        let body = "PRETTY_NAME=\"Ubuntu 22.04.3 LTS\"\nVERSION_CODENAME=jammy\nNAME=\"Ubuntu\"\nID=ubuntu\n";
+        write_os_release(&vfs, body);
+        let stage = Stage {
+            only_if_os: "^Ubuntu$".into(),
+            ..Default::default()
+        };
+        assert_eq!(run(&stage, &vfs), ConditionalOutcome::Run);
+    }
+
+    #[test]
+    fn case_insensitive_regex_flag_matches_uppercase_name() {
+        // Use the regex `(?i)` flag for case-insensitive match against NAME.
+        let vfs = MemVfs::new();
+        write_os_release(&vfs, "NAME=\"UBUNTU\"\n");
+        let stage = Stage {
+            only_if_os: "(?i)ubuntu".into(),
+            ..Default::default()
+        };
+        assert_eq!(run(&stage, &vfs), ConditionalOutcome::Run);
+    }
+
+    #[test]
+    fn case_sensitive_default_skips_when_case_differs() {
+        // Without (?i), `ubuntu` won't match `UBUNTU`.
+        let vfs = MemVfs::new();
+        write_os_release(&vfs, "NAME=\"UBUNTU\"\n");
+        let stage = Stage {
+            only_if_os: "ubuntu".into(),
+            ..Default::default()
+        };
+        assert_eq!(run(&stage, &vfs), ConditionalOutcome::Skip);
+    }
+
+    #[test]
+    fn weird_regex_against_unrelated_name_skips() {
+        // Direct port of the Go `OnlyIfOS` test which configures
+        // `only_if_os: "weird"` — expected to Skip on any normal host.
+        let vfs = MemVfs::new();
+        write_os_release(&vfs, "NAME=\"Ubuntu\"\n");
+        let stage = Stage {
+            only_if_os: "weird".into(),
+            ..Default::default()
+        };
+        assert_eq!(run(&stage, &vfs), ConditionalOutcome::Skip);
+    }
 }

@@ -132,4 +132,101 @@ mod tests {
         assert_eq!(outcome, ConditionalOutcome::Run);
         assert_eq!(console.commands(), vec!["ok".to_string()]);
     }
+
+    // --- Additional tests ported from Go behaviour expectations ---
+
+    #[test]
+    fn command_with_stdout_noise_runs_when_zero_exit() {
+        // A command that prints output AND exits 0 must still Run.
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        console.expect(
+            "echo hello && echo world",
+            Ok("hello\nworld\n".to_string()),
+        );
+        let stage = stage_with_if("echo hello && echo world");
+
+        let outcome = check(&stage, &fs, &console).expect("never errors");
+
+        assert_eq!(outcome, ConditionalOutcome::Run);
+        assert_eq!(
+            console.commands(),
+            vec!["echo hello && echo world".to_string()]
+        );
+    }
+
+    #[test]
+    fn command_with_stderr_noise_runs_when_zero_exit() {
+        // The RecordingConsole Ok-response is just a string. A command can
+        // emit text to stderr (here folded into combined output) and still
+        // succeed — we should not skip.
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        console.expect(
+            "echo warn >&2; true",
+            Ok("warn\n".to_string()),
+        );
+        let stage = stage_with_if("echo warn >&2; true");
+
+        let outcome = check(&stage, &fs, &console).expect("never errors");
+        assert_eq!(outcome, ConditionalOutcome::Run);
+    }
+
+    #[test]
+    fn multi_line_if_script_passes_through_to_console() {
+        // Go passes the `If` string verbatim to `sh -c`; multi-line scripts
+        // should reach the console unchanged.
+        let script = "set -e\nfoo=1\nif [ \"$foo\" = 1 ]; then exit 0; else exit 1; fi";
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        // Default response is Ok — we just need to verify the exact command
+        // string lands at the console without rewriting.
+        let stage = stage_with_if(script);
+
+        let outcome = check(&stage, &fs, &console).expect("never errors");
+        assert_eq!(outcome, ConditionalOutcome::Run);
+        assert_eq!(console.commands(), vec![script.to_string()]);
+    }
+
+    #[test]
+    fn piped_command_passes_through() {
+        // Pipelines are part of the shell string; verify they reach the
+        // console unchanged.
+        let cmd = "ls /etc | grep -q hostname";
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        let stage = stage_with_if(cmd);
+
+        let outcome = check(&stage, &fs, &console).expect("never errors");
+        assert_eq!(outcome, ConditionalOutcome::Run);
+        assert_eq!(console.commands(), vec![cmd.to_string()]);
+    }
+
+    #[test]
+    fn piped_command_with_nonzero_exit_skips() {
+        // Last command in a pipe fails -> conditional skips.
+        let cmd = "echo x | grep -q nope";
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        console.expect(cmd, Err("exit 1".to_string()));
+        let stage = stage_with_if(cmd);
+
+        let outcome = check(&stage, &fs, &console).expect("never errors");
+        assert_eq!(outcome, ConditionalOutcome::Skip);
+    }
+
+    #[test]
+    fn exit_1_skips_matches_go_test() {
+        // Direct port of Go's `if_test.go` `IfConditional` case which
+        // configures `If: "exit 1"` and expects the command was recorded
+        // (Skip outcome on non-zero exit).
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        console.expect("exit 1", Err("exit 1".to_string()));
+        let stage = stage_with_if("exit 1");
+
+        let outcome = check(&stage, &fs, &console).expect("never errors");
+        assert_eq!(outcome, ConditionalOutcome::Skip);
+        assert_eq!(console.commands(), vec!["exit 1".to_string()]);
+    }
 }

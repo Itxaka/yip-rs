@@ -345,4 +345,126 @@ mod tests {
         // Both attempted.
         assert_eq!(console.commands().len(), 2);
     }
+
+    // -------------------------------------------------------------------
+    // Ported from Go: combined-stage, multiline override, dropin with
+    // explicit .service ext, daemon-reload-once with N=5 overrides.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn combined_enable_disable_start_mask_in_one_stage() {
+        let stage = Stage {
+            systemctl: Systemctl {
+                enable: vec!["sshd".into(), "cron".into()],
+                disable: vec!["bluetooth".into()],
+                start: vec!["docker".into()],
+                mask: vec!["telnet".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        run(&stage, &fs, &console).expect("ok");
+        assert_eq!(
+            console.commands(),
+            vec![
+                "systemctl enable sshd".to_string(),
+                "systemctl enable cron".to_string(),
+                "systemctl disable bluetooth".to_string(),
+                "systemctl mask telnet".to_string(),
+                "systemctl start docker".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn multiline_override_content_with_special_chars_round_trips() {
+        // Newlines, quotes, equals signs — all preserved byte-for-byte in
+        // the drop-in file.
+        let body = "[Service]\nExecStart=/bin/sh -c 'echo \"hi=$VAR\" > /tmp/log'\nRestart=on-failure\nEnvironment=\"FOO=bar baz\"\n";
+        let stage = Stage {
+            systemctl: Systemctl {
+                overrides: vec![SystemctlOverride {
+                    service: "complex.service".into(),
+                    content: body.into(),
+                    name: "ml".into(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        run(&stage, &fs, &console).expect("ok");
+        let got = fs
+            .read_to_string(Path::new(
+                "/etc/systemd/system/complex.service.d/ml.conf",
+            ))
+            .unwrap();
+        assert_eq!(got, body);
+    }
+
+    #[test]
+    fn dropin_with_explicit_service_extension_keeps_one_suffix() {
+        // Service already ends in `.service` — the plugin must NOT double-
+        // suffix it.
+        let stage = Stage {
+            systemctl: Systemctl {
+                overrides: vec![SystemctlOverride {
+                    service: "explicit.service".into(),
+                    content: "[Unit]\nDescription=x".into(),
+                    name: "z".into(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        run(&stage, &fs, &console).expect("ok");
+        assert!(fs.exists(Path::new(
+            "/etc/systemd/system/explicit.service.d/z.conf"
+        )));
+        assert!(!fs.exists(Path::new(
+            "/etc/systemd/system/explicit.service.service.d/z.conf"
+        )));
+    }
+
+    #[test]
+    fn daemon_reload_fires_once_for_five_overrides() {
+        let overrides: Vec<SystemctlOverride> = (0..5)
+            .map(|i| SystemctlOverride {
+                service: format!("svc{i}.service"),
+                content: format!("[Service]\nRestart=on-failure-{i}"),
+                name: String::new(),
+            })
+            .collect();
+        let stage = Stage {
+            systemctl: Systemctl {
+                overrides,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        run(&stage, &fs, &console).expect("ok");
+        // All five files written.
+        for i in 0..5 {
+            assert!(
+                fs.exists(Path::new(&format!(
+                    "/etc/systemd/system/svc{i}.service.d/override-yip.conf"
+                ))),
+                "missing override file for svc{i}"
+            );
+        }
+        // Exactly one daemon-reload.
+        let reloads = console
+            .commands()
+            .into_iter()
+            .filter(|c| c == "systemctl daemon-reload")
+            .count();
+        assert_eq!(reloads, 1);
+    }
 }

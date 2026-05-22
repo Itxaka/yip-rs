@@ -280,4 +280,65 @@ mod tests {
             "A=1\n"
         );
     }
+
+    // -------------------------------------------------------------------
+    // Ported from Go: quoted-value preservation, `=` in value, spaces,
+    // override semantics.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn preexisting_quoted_values_preserved_on_merge() {
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        // Existing file has a quoted value and a bare one.
+        fs.write(
+            Path::new(DEFAULT_ENV_FILE),
+            b"QUOTED=\"keep me\"\nBARE=plain\n",
+        )
+        .unwrap();
+        // Merge in a new key — both existing entries must survive, and
+        // QUOTED's spaces must still be present (re-quoted on render).
+        let stage = stage_env(&[("NEW", "val")], None);
+        run(&stage, &fs, &console).unwrap();
+        let got = fs.read_to_string(Path::new(DEFAULT_ENV_FILE)).unwrap();
+        assert!(got.contains("QUOTED=\"keep me\"\n"), "got: {got}");
+        assert!(got.contains("BARE=plain\n"), "got: {got}");
+        assert!(got.contains("NEW=val\n"), "got: {got}");
+    }
+
+    #[test]
+    fn variable_with_equals_in_value() {
+        // E.g. FOO=a=b — yip preserves the entire RHS as the value.
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        let stage = stage_env(&[("FOO", "a=b"), ("FLAGS", "--key=value")], None);
+        run(&stage, &fs, &console).unwrap();
+        let got = fs.read_to_string(Path::new(DEFAULT_ENV_FILE)).unwrap();
+        assert!(got.contains("FOO=a=b\n"), "got: {got}");
+        assert!(got.contains("FLAGS=--key=value\n"), "got: {got}");
+    }
+
+    #[test]
+    fn variable_with_spaces_is_auto_quoted() {
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        let stage = stage_env(&[("MOTD", "welcome to the box")], None);
+        run(&stage, &fs, &console).unwrap();
+        let got = fs.read_to_string(Path::new(DEFAULT_ENV_FILE)).unwrap();
+        assert_eq!(got, "MOTD=\"welcome to the box\"\n");
+    }
+
+    #[test]
+    fn stage_value_beats_existing_for_same_key() {
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        fs.write(Path::new(DEFAULT_ENV_FILE), b"PATH=/old/bin\n")
+            .unwrap();
+        let stage = stage_env(&[("PATH", "/new/bin")], None);
+        run(&stage, &fs, &console).unwrap();
+        let got = fs.read_to_string(Path::new(DEFAULT_ENV_FILE)).unwrap();
+        // Single entry — stage value wins.
+        assert_eq!(got, "PATH=/new/bin\n");
+        assert!(!got.contains("/old/bin"));
+    }
 }

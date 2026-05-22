@@ -443,4 +443,144 @@ mod tests {
         plugin(&stage_pins(&[("foo", "1.0")]), &fs, &console).unwrap();
         assert!(fs.exists(Path::new("/etc/apt/preferences.d/foo.pref")));
     }
+
+    // --- Additional tests ported from Go behaviour expectations ---
+
+    #[test]
+    fn apt_three_pins_write_three_files() {
+        let fs = MemVfs::new();
+        write_os_release(&fs, "ID=ubuntu\n");
+        let console = RecordingConsole::new();
+        run(
+            &stage_pins(&[
+                ("foo", "1.2.3"),
+                ("bar", "0.99"),
+                ("baz", "5.5.5"),
+            ]),
+            &fs,
+            &console,
+        )
+        .unwrap();
+        assert!(fs.exists(Path::new("/etc/apt/preferences.d/foo.pref")));
+        assert!(fs.exists(Path::new("/etc/apt/preferences.d/bar.pref")));
+        assert!(fs.exists(Path::new("/etc/apt/preferences.d/baz.pref")));
+        // Each file gets the standard Pin-Priority: 1001 line.
+        for n in ["foo", "bar", "baz"] {
+            let p = format!("/etc/apt/preferences.d/{n}.pref");
+            let got = fs.read_to_string(Path::new(&p)).unwrap();
+            assert!(
+                got.contains("Pin-Priority: 1001"),
+                "{n}.pref should contain Pin-Priority: 1001, got: {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn apt_version_with_relational_operator_is_stored_verbatim() {
+        // Per the Rust port spec, the version string is written verbatim
+        // into `Pin: version <ver>`. Apt itself interprets `>=` etc;
+        // priority remains 1001.
+        let fs = MemVfs::new();
+        write_os_release(&fs, "ID=ubuntu\n");
+        let console = RecordingConsole::new();
+        run(&stage_pins(&[("kernel", ">=5.15")]), &fs, &console).unwrap();
+        let got = fs
+            .read_to_string(Path::new("/etc/apt/preferences.d/kernel.pref"))
+            .unwrap();
+        assert_eq!(
+            got,
+            "Package: kernel\nPin: version >=5.15\nPin-Priority: 1001\n"
+        );
+    }
+
+    #[test]
+    fn dnf_writes_protected_file_without_versionlock_plugin_installed() {
+        // The plugin doesn't check whether dnf-plugin-versionlock is
+        // installed on disk — it always writes the per-pkg protected
+        // file and idempotently appends `versionlock` to dnf.conf.
+        let fs = MemVfs::new();
+        write_os_release(&fs, "ID=fedora\n");
+        // Pre-create dnf.conf without versionlock; ensure no related
+        // python plugin file is present.
+        fs.write(Path::new("/etc/dnf/dnf.conf"), b"[main]\ngpgcheck=1\n")
+            .unwrap();
+        let console = RecordingConsole::new();
+        run(&stage_pins(&[("kernel", "5.14")]), &fs, &console).unwrap();
+        // protected.d entry written
+        assert!(fs.exists(Path::new("/etc/dnf/protected.d/kernel.conf")));
+        // dnf.conf got the versionlock line appended
+        let conf = fs.read_to_string(Path::new("/etc/dnf/dnf.conf")).unwrap();
+        assert!(conf.contains("gpgcheck=1"));
+        assert!(conf.contains("versionlock"));
+    }
+
+    #[test]
+    fn rerun_is_idempotent_for_apt() {
+        // Two consecutive runs should leave the same file content.
+        let fs = MemVfs::new();
+        write_os_release(&fs, "ID=ubuntu\n");
+        let console = RecordingConsole::new();
+        run(&stage_pins(&[("foo", "1.0")]), &fs, &console).unwrap();
+        let after_one = fs
+            .read_to_string(Path::new("/etc/apt/preferences.d/foo.pref"))
+            .unwrap();
+        run(&stage_pins(&[("foo", "1.0")]), &fs, &console).unwrap();
+        let after_two = fs
+            .read_to_string(Path::new("/etc/apt/preferences.d/foo.pref"))
+            .unwrap();
+        assert_eq!(after_one, after_two, "apt pref file should be stable across re-runs");
+    }
+
+    #[test]
+    fn rerun_is_idempotent_for_dnf() {
+        // Two consecutive runs: dnf.conf should still have exactly one
+        // versionlock line.
+        let fs = MemVfs::new();
+        write_os_release(&fs, "ID=fedora\n");
+        let console = RecordingConsole::new();
+        run(&stage_pins(&[("foo", "1.0")]), &fs, &console).unwrap();
+        run(&stage_pins(&[("foo", "1.0")]), &fs, &console).unwrap();
+        let conf = fs.read_to_string(Path::new("/etc/dnf/dnf.conf")).unwrap();
+        let count = conf.lines().filter(|l| l.trim() == "versionlock").count();
+        assert_eq!(
+            count, 1,
+            "versionlock should appear exactly once after re-run, got: {conf}"
+        );
+    }
+
+    #[test]
+    fn rerun_is_idempotent_for_apk() {
+        // Two consecutive runs against an apk host: world file should
+        // still contain a single `foo=1.0` line.
+        let fs = MemVfs::new();
+        write_os_release(&fs, "ID=alpine\n");
+        let console = RecordingConsole::new();
+        run(&stage_pins(&[("foo", "1.0")]), &fs, &console).unwrap();
+        run(&stage_pins(&[("foo", "1.0")]), &fs, &console).unwrap();
+        let world = fs.read_to_string(Path::new("/etc/apk/world")).unwrap();
+        let count = world.lines().filter(|l| *l == "foo=1.0").count();
+        assert_eq!(count, 1, "duplicate apk world entries: {world}");
+    }
+
+    #[test]
+    fn apt_handles_special_version_chars_in_value() {
+        // Versions sometimes include `+`, `~`, `:`. The pref body must
+        // store them verbatim.
+        let fs = MemVfs::new();
+        write_os_release(&fs, "ID=ubuntu\n");
+        let console = RecordingConsole::new();
+        run(
+            &stage_pins(&[("pkg", "1:2.3.4-5+deb11u1~bpo10+1")]),
+            &fs,
+            &console,
+        )
+        .unwrap();
+        let got = fs
+            .read_to_string(Path::new("/etc/apt/preferences.d/pkg.pref"))
+            .unwrap();
+        assert!(
+            got.contains("Pin: version 1:2.3.4-5+deb11u1~bpo10+1"),
+            "verbatim version string expected, got: {got}"
+        );
+    }
 }

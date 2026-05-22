@@ -127,4 +127,82 @@ mod tests {
         let err = run(&stage, &fs, &console).expect_err("propagates");
         assert!(matches!(err, crate::error::Error::Cmd { .. }));
     }
+
+    // -------------------------------------------------------------------
+    // Ported from Go: every documented key, true→flag, empty value edge.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn all_documented_keys_combine_into_sorted_single_call() {
+        // locale, keymap, hostname, timezone, root-password, root-password-hashed
+        // all collapse into ONE shell-out, alphabetically.
+        let mut m = HashMap::new();
+        m.insert("locale".into(), "en_US.UTF-8".into());
+        m.insert("keymap".into(), "us".into());
+        m.insert("hostname".into(), "host1".into());
+        m.insert("timezone".into(), "UTC".into());
+        m.insert("root-password".into(), "secret".into());
+        m.insert("root-password-hashed".into(), "$6$hashed".into());
+
+        let stage = Stage {
+            systemd_firstboot: m,
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        run(&stage, &fs, &console).expect("ok");
+
+        let cmds = console.commands();
+        assert_eq!(cmds.len(), 1, "exactly one shell-out");
+        // Alphabetically sorted by the rendered "--key" / "--key=val" form.
+        assert_eq!(
+            cmds[0],
+            "systemd-firstboot --hostname=host1 \
+             --keymap=us \
+             --locale=en_US.UTF-8 \
+             --root-password-hashed=$6$hashed \
+             --root-password=secret \
+             --timezone=UTC"
+        );
+    }
+
+    #[test]
+    fn value_true_emits_bare_flag_not_key_value() {
+        // value=="true" → bare `--key` form (boolean), not `--key=true`.
+        let mut m = HashMap::new();
+        m.insert("force".into(), "true".into());
+        m.insert("prompt-keymap".into(), "true".into());
+        let stage = Stage {
+            systemd_firstboot: m,
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        run(&stage, &fs, &console).expect("ok");
+        let cmds = console.commands();
+        assert_eq!(cmds.len(), 1);
+        assert!(cmds[0].contains(" --force "));
+        assert!(cmds[0].ends_with(" --prompt-keymap") || cmds[0].contains(" --prompt-keymap "));
+        // Never the long form for these.
+        assert!(!cmds[0].contains("--force=true"));
+        assert!(!cmds[0].contains("--prompt-keymap=true"));
+    }
+
+    #[test]
+    fn empty_value_emits_key_equals_empty() {
+        // Edge: value is "" (not "true") — emits --key= with nothing on the RHS.
+        let mut m = HashMap::new();
+        m.insert("keymap".into(), String::new());
+        let stage = Stage {
+            systemd_firstboot: m,
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        run(&stage, &fs, &console).expect("ok");
+        assert_eq!(
+            console.commands(),
+            vec!["systemd-firstboot --keymap=".to_string()]
+        );
+    }
 }

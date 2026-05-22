@@ -124,4 +124,103 @@ mod tests {
         let out = check(&stage, &fs, &console).expect("check ok");
         assert_eq!(out, ConditionalOutcome::Skip);
     }
+
+    // --- Additional tests ported from Go behaviour expectations ---
+
+    /// Drive the matcher against every supported architecture string in a
+    /// parameterised loop. We don't have a way to override `env::consts::ARCH`
+    /// at runtime, so we exercise the regex / matcher side by:
+    ///   - building patterns that DO match the runtime arch (Run expected)
+    ///   - and patterns that don't (Skip expected)
+    /// for each candidate.
+    #[test]
+    fn parameterised_arches_runtime_arch_runs_others_skip() {
+        let runtime = std::env::consts::ARCH;
+        // Each entry is the user-supplied regex.
+        let cases = [
+            "x86_64",
+            "aarch64",
+            "riscv64",
+            "arm",
+            // Patterns intentionally aliasing on the runtime — to catch
+            // typos in the implementation.
+            "x86.*",
+            "aarch.*",
+            "riscv.*",
+            "^arm$",
+        ];
+        for pat in cases {
+            let fs = RealVfs::new();
+            let console = RecordingConsole::new();
+            let stage = Stage {
+                only_if_arch: pat.to_string(),
+                ..Default::default()
+            };
+            let out = check(&stage, &fs, &console).expect("check ok");
+            // The pattern matches iff a freshly-compiled regex says so.
+            let want = match regex::Regex::new(pat) {
+                Ok(re) if re.is_match(runtime) => ConditionalOutcome::Run,
+                _ => ConditionalOutcome::Skip,
+            };
+            assert_eq!(out, want, "pattern {pat:?} against arch {runtime}");
+        }
+    }
+
+    #[test]
+    fn unrelated_arch_pattern_skips() {
+        // Direct port of Go's `IfArch` "Fails with no match" — only_arch
+        // = "weird" must Skip on any real host.
+        let stage = Stage {
+            only_if_arch: "weird".to_string(),
+            ..Default::default()
+        };
+        let fs = RealVfs::new();
+        let console = RecordingConsole::new();
+        let out = check(&stage, &fs, &console).expect("check ok");
+        assert_eq!(out, ConditionalOutcome::Skip);
+    }
+
+    #[test]
+    fn alternation_with_runtime_arch_matches() {
+        // A pattern listing several arches should match if the runtime is
+        // one of them. Always include the runtime arch so the alternation
+        // matches on every CI host.
+        let runtime = std::env::consts::ARCH;
+        let pattern = format!("({}|definitely-not-an-arch)", runtime);
+        let stage = Stage {
+            only_if_arch: pattern,
+            ..Default::default()
+        };
+        let fs = RealVfs::new();
+        let console = RecordingConsole::new();
+        let out = check(&stage, &fs, &console).expect("check ok");
+        assert_eq!(out, ConditionalOutcome::Run);
+    }
+
+    #[test]
+    fn anchored_runtime_arch_matches() {
+        let runtime = std::env::consts::ARCH;
+        let stage = Stage {
+            only_if_arch: format!("^{}$", runtime),
+            ..Default::default()
+        };
+        let fs = RealVfs::new();
+        let console = RecordingConsole::new();
+        let out = check(&stage, &fs, &console).expect("check ok");
+        assert_eq!(out, ConditionalOutcome::Run);
+    }
+
+    #[test]
+    fn empty_filter_short_circuits_without_consulting_regex() {
+        // Even a clearly invalid regex shouldn't matter if the filter is
+        // empty (early-return). Combined here with an empty filter.
+        let stage = Stage {
+            only_if_arch: String::new(),
+            ..Default::default()
+        };
+        let fs = RealVfs::new();
+        let console = RecordingConsole::new();
+        let out = check(&stage, &fs, &console).expect("check ok");
+        assert_eq!(out, ConditionalOutcome::Run);
+    }
 }

@@ -257,4 +257,114 @@ mod tests {
         assert!(fs.exists(Path::new("/ok")));
         assert!(fs.exists(Path::new("/also-ok")));
     }
+
+    // -------------------------------------------------------------------
+    // Ported from Go: chmod-on-existing, deep nesting, numeric vs string
+    // owner, special mode bits.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn chmod_on_already_existing_dir_changes_mode() {
+        // Pre-create the dir with 0o755 (without our plugin) then re-run with
+        // 0o700 — final mode must be the requested one.
+        let fs = MemVfs::new();
+        fs.mkdir_all(Path::new("/preexisting")).unwrap();
+        fs.chmod(Path::new("/preexisting"), 0o755).unwrap();
+
+        let stage = Stage {
+            directories: vec![Directory {
+                path: "/preexisting".to_string(),
+                permissions: 0o700,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let console = RecordingConsole::default();
+        run(&stage, &fs, &console).expect("ok");
+        let m = fs.metadata(Path::new("/preexisting")).expect("metadata");
+        assert_eq!(m.mode, 0o700);
+    }
+
+    #[test]
+    fn deep_nested_path_five_levels() {
+        let stage = Stage {
+            directories: vec![Directory {
+                path: "/a/b/c/d/e".to_string(),
+                permissions: 0o755,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        run(&stage, &fs, &console).expect("ok");
+        for p in ["/a", "/a/b", "/a/b/c", "/a/b/c/d", "/a/b/c/d/e"] {
+            assert!(fs.exists(Path::new(p)), "missing: {p}");
+        }
+        let m = fs.metadata(Path::new("/a/b/c/d/e")).expect("metadata");
+        assert_eq!(m.mode, 0o755);
+    }
+
+    #[test]
+    fn group_only_chown_applies_with_uid_zero() {
+        // OwnerId::Numeric(0) + group=42 -> chown is applied (early-return
+        // only triggers when BOTH uid and gid are zero).
+        let stage = Stage {
+            directories: vec![Directory {
+                path: "/grouponly".to_string(),
+                permissions: 0o755,
+                owner: OwnerId::Numeric(0),
+                group: 42,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        run(&stage, &fs, &console).expect("ok");
+        let m = fs.metadata(Path::new("/grouponly")).expect("metadata");
+        assert_eq!((m.uid, m.gid), (0, 42));
+    }
+
+    #[test]
+    fn string_owner_warn_path_does_not_chown() {
+        // Explicit username string — plugin warns and leaves uid/gid at 0.
+        let stage = Stage {
+            directories: vec![Directory {
+                path: "/strowner".to_string(),
+                permissions: 0o755,
+                owner: OwnerId::Name("bob".to_string()),
+                group: 5,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        run(&stage, &fs, &console).expect("ok");
+        let m = fs.metadata(Path::new("/strowner")).expect("metadata");
+        // Name-based owner aborts chown entirely (Go matches: warn + skip).
+        assert_eq!((m.uid, m.gid), (0, 0));
+    }
+
+    #[test]
+    fn special_mode_bits_setuid_setgid_sticky_round_trip() {
+        // 0o4755 = setuid+0755, 0o2755 = setgid, 0o1755 = sticky.
+        for mode in [0o4755u32, 0o2755, 0o1755, 0o7777] {
+            let path = format!("/special/{:o}", mode);
+            let stage = Stage {
+                directories: vec![Directory {
+                    path: path.clone(),
+                    permissions: mode,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let fs = MemVfs::new();
+            let console = RecordingConsole::default();
+            run(&stage, &fs, &console).expect("ok");
+            let m = fs.metadata(Path::new(&path)).expect("metadata");
+            assert_eq!(m.mode, mode, "round-trip for {:o}", mode);
+        }
+    }
 }

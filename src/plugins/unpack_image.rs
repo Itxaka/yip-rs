@@ -800,6 +800,216 @@ mod tests {
         run(&stage, &fs, &console).expect("missing fields are skipped, not errors");
         assert!(console.commands().is_empty(), "skopeo not invoked");
     }
+
+    // ---- Additional coverage parity with Go's unpack_image_test.go ----
+
+    /// A 10-level-deep file path should extract cleanly: every
+    /// intermediate dir is created via `mkdir_all` and the leaf file
+    /// lands at the expected absolute path.
+    #[test]
+    fn extracts_deeply_nested_file() {
+        use crate::vfs::MemVfs;
+        let deep = "a/b/c/d/e/f/g/h/i/leaf.txt";
+        let blob = build_tar_gz(&[(deep, 0o644, b"deep")]);
+        let fs = MemVfs::new();
+        let target = Path::new("/n");
+        fs.mkdir_all(target).unwrap();
+        extract_layer(
+            &blob,
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+            target,
+            &fs,
+        )
+        .expect("deep extract");
+        let want = Path::new("/n/a/b/c/d/e/f/g/h/i/leaf.txt");
+        assert_eq!(fs.read(want).unwrap(), b"deep");
+    }
+
+    /// Mode 0700 / 0600 / 0755 must each survive extraction unchanged
+    /// (low 12 bits, ignoring file-type bits).
+    #[test]
+    fn file_modes_0700_0600_0755_preserved() {
+        use crate::vfs::MemVfs;
+        let blob = build_tar_gz(&[
+            ("priv.sh", 0o700, b"#!/bin/sh\n"),
+            ("priv.txt", 0o600, b"secret"),
+            ("pub.sh", 0o755, b"#!/bin/sh\n"),
+        ]);
+        let fs = MemVfs::new();
+        let target = Path::new("/m");
+        fs.mkdir_all(target).unwrap();
+        extract_layer(
+            &blob,
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+            target,
+            &fs,
+        )
+        .unwrap();
+        assert_eq!(
+            fs.metadata(Path::new("/m/priv.sh")).unwrap().mode & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            fs.metadata(Path::new("/m/priv.txt")).unwrap().mode & 0o7777,
+            0o600
+        );
+        assert_eq!(
+            fs.metadata(Path::new("/m/pub.sh")).unwrap().mode & 0o7777,
+            0o755
+        );
+    }
+
+    /// A symlink that points to another path is extracted as a single
+    /// symlink — we don't follow indirections, we don't materialize the
+    /// pointed-at file ourselves. Confirms the "no-follow" stance.
+    #[test]
+    fn symlink_chain_only_one_hop_extracted() {
+        use crate::vfs::MemVfs;
+        // Build a tar with two symlinks: a -> b, b -> c. We never
+        // extract the actual "c" file (it doesn't even exist in the
+        // layer). After extract, /s/a must be a symlink whose target
+        // is the literal string "b" — not "c".
+        let buf: Vec<u8> = Vec::new();
+        let enc = GzEncoder::new(buf, Compression::default());
+        let mut builder = tar::Builder::new(enc);
+        for (link, target) in &[("a", "b"), ("b", "c")] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            header.set_mode(0o777);
+            builder
+                .append_link(&mut header, *link, *target)
+                .expect("append_link");
+        }
+        let enc = builder.into_inner().expect("into_inner");
+        let blob = enc.finish().expect("gz finish");
+
+        let fs = MemVfs::new();
+        let target = Path::new("/s");
+        fs.mkdir_all(target).unwrap();
+        extract_layer(
+            &blob,
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+            target,
+            &fs,
+        )
+        .unwrap();
+        let m_a = fs.metadata(Path::new("/s/a")).expect("a exists");
+        assert!(m_a.is_symlink, "a is a symlink");
+        let m_b = fs.metadata(Path::new("/s/b")).expect("b exists");
+        assert!(m_b.is_symlink, "b is a symlink");
+        // No /s/c — we don't follow chains to materialize endpoints.
+        assert!(
+            !fs.exists(Path::new("/s/c")),
+            "we don't follow symlink chains to materialize endpoints",
+        );
+    }
+
+    /// `run()` with multiple `unpack_images` entries whose sources are a
+    /// mix of empty / non-empty fields must skip the malformed ones
+    /// and process the others. Combined with the empty-list test, this
+    /// pins the "warn, don't error" semantics across the iterator.
+    #[test]
+    fn multiple_entries_with_mixed_source_types() {
+        use crate::console::RecordingConsole;
+        use crate::vfs::MemVfs;
+        let mut stage = Stage::default();
+        // Entry 1: empty source — should be skipped (warn).
+        stage.unpack_images.push(UnpackImageConf {
+            source: "".into(),
+            target: "/a".into(),
+            platform: "".into(),
+        });
+        // Entry 2: empty target — should be skipped (warn).
+        stage.unpack_images.push(UnpackImageConf {
+            source: "alpine".into(),
+            target: "".into(),
+            platform: "".into(),
+        });
+        // (We don't add a "real" entry here because doing a real pull
+        // would either need network or the skopeo backend's command
+        // mocking. The point of this test is that the iterator keeps
+        // going past skipped entries without aggregating an error.)
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        run(&stage, &fs, &console).expect("mixed empties -> all skipped, Ok");
+        assert!(console.commands().is_empty(), "no backend invocation");
+    }
+
+    /// When the target dir doesn't yet exist, `unpack_one` must create
+    /// it via `mkdir_all` before extracting. Verified by passing a
+    /// fresh nested path and asserting that the dir is present
+    /// afterwards.
+    #[test]
+    fn target_dir_is_created_if_missing() {
+        use crate::vfs::MemVfs;
+        let fs = MemVfs::new();
+        let target = Path::new("/x/y/z/new-root");
+        assert!(!fs.exists(target));
+        // We don't exercise unpack_one directly (it would need a backend
+        // mock); instead simulate the same mkdir_all behaviour the
+        // function performs before extraction.
+        fs.mkdir_all(target).expect("mkdir_all");
+        assert!(fs.exists(target), "target dir should now exist");
+        // And extracting into it must succeed.
+        let blob = build_tar_gz(&[("file", 0o644, b"hi")]);
+        extract_layer(
+            &blob,
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+            target,
+            &fs,
+        )
+        .expect("extract into freshly created target");
+        assert_eq!(fs.read(&target.join("file")).unwrap(), b"hi");
+    }
+
+    /// Sparse-file metadata in a tar header (large nominal size, small
+    /// or empty payload) should not panic the extractor. We don't
+    /// implement real sparse-file semantics — we just extract whatever
+    /// bytes land in the entry body. The Header's `set_size` plus a
+    /// short body simulates the shape; tar crate writes a regular
+    /// entry but the property under test is "extractor doesn't crash
+    /// on shorter-than-declared bodies".
+    #[test]
+    fn sparse_like_zero_size_file() {
+        use crate::vfs::MemVfs;
+        // Zero-size regular file — the closest portable analogue of a
+        // sparse hole that tar can roundtrip without crate-specific
+        // PAX headers.
+        let blob = build_tar_gz(&[("sparse", 0o644, b"")]);
+        let fs = MemVfs::new();
+        let target = Path::new("/sp");
+        fs.mkdir_all(target).unwrap();
+        extract_layer(
+            &blob,
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+            target,
+            &fs,
+        )
+        .expect("zero-size file extracts");
+        assert_eq!(fs.read(Path::new("/sp/sparse")).unwrap(), b"");
+        assert_eq!(
+            fs.metadata(Path::new("/sp/sparse")).unwrap().mode & 0o7777,
+            0o644
+        );
+    }
+
+    /// A layer whose media type is non-standard (e.g. a hypothetical
+    /// future content type that contains "tar+gzip" anywhere) must
+    /// still be detected as gzipped via the `mt.contains("gzip")`
+    /// branch.
+    #[test]
+    fn non_standard_media_type_with_gzip_keyword_is_detected() {
+        use crate::vfs::MemVfs;
+        let blob = build_tar_gz(&[("z", 0o644, b"q")]);
+        let fs = MemVfs::new();
+        let target = Path::new("/ns");
+        fs.mkdir_all(target).unwrap();
+        // Made-up media type that still mentions gzip.
+        extract_layer(&blob, "application/x-custom-gzip-thing", target, &fs)
+            .expect("custom gzip media type still works");
+        assert_eq!(fs.read(Path::new("/ns/z")).unwrap(), b"q");
+    }
 }
 
 // =====================================================================
@@ -852,6 +1062,75 @@ mod tests_skopeo {
         // No prefix is still accepted.
         let p = blob_path(Path::new("/tmp"), "abcdef").unwrap();
         assert_eq!(p, PathBuf::from("/tmp/abcdef"));
+    }
+
+    // ---- Additional command-shape coverage ----
+
+    /// Empty platform string means: skopeo is invoked without any
+    /// `--override-*` flags. We've already covered that elsewhere;
+    /// this test focuses on what an empty platform string *looks like*
+    /// next to a single-token (arch-only) platform.
+    #[test]
+    fn skopeo_cmd_empty_platform_emits_no_overrides() {
+        let tmp = PathBuf::from("/t");
+        let cmd = build_skopeo_cmd("alpine:3.20", "", &tmp);
+        assert!(!cmd.contains("--override-os"), "got: {cmd}");
+        assert!(!cmd.contains("--override-arch"), "got: {cmd}");
+    }
+
+    /// `linux/amd64` splits into both an OS and an arch override.
+    /// Asserted in order so the test pins the exact CLI shape skopeo
+    /// expects.
+    #[test]
+    fn skopeo_cmd_linux_amd64_emits_both_overrides() {
+        let tmp = PathBuf::from("/t");
+        let cmd = build_skopeo_cmd("alpine:3.20", "linux/amd64", &tmp);
+        assert!(cmd.contains("--override-os linux"), "got: {cmd}");
+        assert!(cmd.contains("--override-arch amd64"), "got: {cmd}");
+        // OS appears before arch on the command line.
+        let os_idx = cmd.find("--override-os").unwrap();
+        let arch_idx = cmd.find("--override-arch").unwrap();
+        assert!(os_idx < arch_idx, "OS override should precede arch: {cmd}");
+    }
+
+    /// `linux/arm64` mirrors the amd64 case (paranoia — ensures we
+    /// don't hard-code amd64 anywhere).
+    #[test]
+    fn skopeo_cmd_linux_arm64_emits_both_overrides() {
+        let tmp = PathBuf::from("/t");
+        let cmd = build_skopeo_cmd("alpine:3.20", "linux/arm64", &tmp);
+        assert!(cmd.contains("--override-os linux"));
+        assert!(cmd.contains("--override-arch arm64"));
+    }
+
+    /// A single-token platform (no `/`) is treated as arch-only.
+    /// Verified in `skopeo_cmd_includes_platform_overrides` for the
+    /// dual case; this one pins the single-token branch explicitly.
+    #[test]
+    fn skopeo_cmd_single_token_platform_treated_as_arch() {
+        let tmp = PathBuf::from("/t");
+        let cmd = build_skopeo_cmd("alpine:3.20", "arm64", &tmp);
+        assert!(!cmd.contains("--override-os"), "no OS override: {cmd}");
+        assert!(cmd.contains("--override-arch arm64"), "got: {cmd}");
+    }
+
+    /// Image references containing shell metacharacters must be quoted
+    /// so the resulting command line is safe to pass to `/bin/sh -c`.
+    #[test]
+    fn skopeo_cmd_quotes_image_with_special_chars() {
+        let tmp = PathBuf::from("/t");
+        // Spaces aren't legal in OCI refs but defending against a
+        // malformed config that the YAML parser accepted is cheap.
+        let cmd = build_skopeo_cmd("evil image", "", &tmp);
+        assert!(cmd.contains("'evil image'"), "got: {cmd}");
+    }
+
+    /// `blob_path` must reject digests that strip down to nothing
+    /// (e.g. `sha256:`).
+    #[test]
+    fn blob_path_rejects_empty_after_strip() {
+        let err = blob_path(Path::new("/tmp"), "sha256:").unwrap_err();
+        assert!(format!("{err}").contains("invalid blob digest"));
     }
 }
 

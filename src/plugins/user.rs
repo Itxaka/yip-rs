@@ -1090,4 +1090,259 @@ mod tests {
         assert!(!looks_hashed("hunter2"));
         assert!(!looks_hashed(""));
     }
+
+    // --- Additional tests ported from Go behaviour expectations ---
+
+    #[test]
+    fn empty_password_writes_star_in_shadow() {
+        // No password_hash, no lock -> Go writes `*` in /etc/shadow.
+        let fs = MemVfs::new();
+        let con = RecordingConsole::new();
+        seed_empty(&fs);
+
+        let stage = one_user("dora", User::default());
+        run(&stage, &fs, &con).unwrap();
+
+        let shadow = read(&fs, ETC_SHADOW);
+        assert!(
+            shadow.contains("dora:*:"),
+            "expected '*' as locked-no-password placeholder, got: {shadow}"
+        );
+    }
+
+    #[test]
+    fn explicit_uid_wins_over_auto_allocation() {
+        // Even though /etc/passwd already has UID 1001 (which would push
+        // the auto-allocated UID to 1002), an explicit `uid: 1234` must be
+        // honoured.
+        let fs = MemVfs::new();
+        let con = RecordingConsole::new();
+        write(
+            &fs,
+            ETC_PASSWD,
+            "root:x:0:0::/root:/bin/sh\nfred:x:1001:1001::/home/fred:/bin/sh\n",
+        );
+        write(&fs, ETC_SHADOW, "");
+        write(&fs, ETC_GROUP, "root:x:0:\nfred:x:1001:fred\n");
+
+        let stage = one_user(
+            "evelyn",
+            User {
+                uid: "1234".into(),
+                ..Default::default()
+            },
+        );
+        run(&stage, &fs, &con).unwrap();
+
+        let passwd = read(&fs, ETC_PASSWD);
+        assert!(
+            passwd.contains("evelyn:x:1234:"),
+            "explicit uid 1234 should win, got: {passwd}"
+        );
+    }
+
+    #[test]
+    fn username_with_dot_and_dash_special_chars() {
+        // POSIX usernames sometimes contain `.` or `-` (e.g. `nm-openvpn`,
+        // `john.doe`). The plugin must round-trip both characters through
+        // /etc/passwd lookup.
+        let fs = MemVfs::new();
+        let con = RecordingConsole::new();
+        seed_empty(&fs);
+
+        for name in ["john.doe", "nm-openvpn", "user-with-dots.and-dashes"] {
+            let stage = one_user(
+                name,
+                User {
+                    ..Default::default()
+                },
+            );
+            run(&stage, &fs, &con).unwrap();
+            let passwd = read(&fs, ETC_PASSWD);
+            assert!(
+                passwd.contains(&format!("{name}:x:")),
+                "{name} should appear in /etc/passwd, got: {passwd}"
+            );
+        }
+    }
+
+    #[test]
+    fn preexisting_user_gets_updated_password_hash() {
+        // Go test "edits already existing user password": foo exists in
+        // passwd + shadow; supply a new password; shadow row's password
+        // field is replaced while UID stays the same.
+        let fs = MemVfs::new();
+        let con = RecordingConsole::new();
+        write(
+            &fs,
+            ETC_PASSWD,
+            "foo:x:1500:1500:old gecos:/home/foo:/bin/sh\n",
+        );
+        write(
+            &fs,
+            ETC_SHADOW,
+            "foo:$6$OLD$OLDHASH:18820:0:99999:7:::\n",
+        );
+        write(&fs, ETC_GROUP, "foo:x:1500:foo\n");
+
+        run(
+            &one_user(
+                "foo",
+                User {
+                    password_hash: "$NEWHASH".into(),
+                    ..Default::default()
+                },
+            ),
+            &fs,
+            &con,
+        )
+        .unwrap();
+
+        let shadow = read(&fs, ETC_SHADOW);
+        assert!(
+            shadow.contains("foo:$NEWHASH:"),
+            "new hash must replace old, got: {shadow}"
+        );
+        // The original UID 1500 should be retained because `uid` was not
+        // explicitly provided.
+        let passwd = read(&fs, ETC_PASSWD);
+        assert!(
+            passwd.contains("foo:x:1500:"),
+            "existing UID preserved, got: {passwd}"
+        );
+    }
+
+    #[test]
+    fn nonexistent_secondary_group_is_silent_no_op() {
+        // Already covered by `missing_secondary_group_is_silently_skipped`,
+        // but here we additionally assert there's no error/warning
+        // surfaced via Multi.
+        let fs = MemVfs::new();
+        let con = RecordingConsole::new();
+        seed_empty(&fs);
+
+        let res = run(
+            &one_user(
+                "alice",
+                User {
+                    groups: vec!["does-not-exist-anywhere".into(), "also-missing".into()],
+                    ..Default::default()
+                },
+            ),
+            &fs,
+            &con,
+        );
+        // No errors aggregated — secondary group misses are best-effort.
+        assert!(res.is_ok(), "expected Ok, got {res:?}");
+    }
+
+    #[test]
+    fn shell_bin_false_locks_account_login() {
+        // Setting shell to /bin/false is a common pattern for locking
+        // interactive login while keeping the account valid.
+        let fs = MemVfs::new();
+        let con = RecordingConsole::new();
+        seed_empty(&fs);
+
+        run(
+            &one_user(
+                "svcacct",
+                User {
+                    uid: "1500".into(),
+                    shell: "/bin/false".into(),
+                    ..Default::default()
+                },
+            ),
+            &fs,
+            &con,
+        )
+        .unwrap();
+
+        let passwd = read(&fs, ETC_PASSWD);
+        // Match just the shell field — the auto-allocated GID is impl-defined.
+        assert!(
+            passwd.lines().any(|l| l.starts_with("svcacct:") && l.ends_with(":/bin/false")),
+            "shell field should be /bin/false, got: {passwd}"
+        );
+    }
+
+    #[test]
+    fn gecos_with_commas_and_spaces_passes_through() {
+        // The gecos field contains comma-separated subfields per the spec
+        // ("Full Name,Room Number,Work Phone,Home Phone,Other"). Spaces
+        // and commas must survive into the passwd line.
+        let fs = MemVfs::new();
+        let con = RecordingConsole::new();
+        seed_empty(&fs);
+
+        run(
+            &one_user(
+                "alice",
+                User {
+                    uid: "1000".into(),
+                    gecos: "Alice Wonderland,Room 1,555-1212,,extra info".into(),
+                    ..Default::default()
+                },
+            ),
+            &fs,
+            &con,
+        )
+        .unwrap();
+
+        let passwd = read(&fs, ETC_PASSWD);
+        assert!(
+            passwd.contains("alice:x:1000:1000:Alice Wonderland,Room 1,555-1212,,extra info:/home/alice:/bin/sh"),
+            "gecos with commas should pass through, got: {passwd}"
+        );
+    }
+
+    #[test]
+    fn ssh_keys_from_url_provider_via_mockito() {
+        // The user-plugin's ssh_authorized_keys are inserted verbatim — it
+        // does NOT fetch URLs (that's the SSH plugin's job). So we provide
+        // a "raw" key that happens to look like content fetched from a URL
+        // and assert it lands verbatim. This guards against any future
+        // change accidentally adding URL-fetching to the user plugin.
+        let mut server = mockito::Server::new();
+        let body = "ssh-rsa AAAAB3NzaC1yc2E-from-url alice@host\n";
+        let _m = server
+            .mock("GET", "/keys")
+            .with_status(200)
+            .with_body(body)
+            .create();
+
+        let fs = MemVfs::new();
+        let con = RecordingConsole::new();
+        seed_empty(&fs);
+
+        // Pre-fetch the keys ourselves to simulate "this is what the SSH
+        // plugin would have written" and then drive the user plugin with
+        // the resolved key string. Mockito serves the body so the test
+        // is symmetric with the ssh.rs URL-fetch tests.
+        let resp = reqwest::blocking::get(format!("{}/keys", server.url()))
+            .expect("mock fetch")
+            .text()
+            .expect("body");
+        assert_eq!(resp, body);
+
+        run(
+            &one_user(
+                "alice",
+                User {
+                    uid: "1000".into(),
+                    ssh_authorized_keys: vec![resp.trim().to_string()],
+                    ..Default::default()
+                },
+            ),
+            &fs,
+            &con,
+        )
+        .unwrap();
+
+        let ak = read(&fs, "/home/alice/.ssh/authorized_keys");
+        assert!(
+            ak.contains("ssh-rsa AAAAB3NzaC1yc2E-from-url alice@host"),
+            "URL-resolved key should land verbatim, got: {ak}"
+        );
+    }
 }

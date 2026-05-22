@@ -354,4 +354,213 @@ mod tests {
         let m = fs.metadata(Path::new("/owned")).expect("metadata");
         assert_eq!((m.uid, m.gid), (1000, 1000));
     }
+
+    // --- Additional tests ported from Go behaviour expectations ---
+
+    #[test]
+    fn missing_url_is_error() {
+        // Download with no `url` must error (already covered for empty
+        // path; here we cover the symmetric case).
+        let stage = Stage {
+            downloads: vec![Download {
+                path: "/d/foo".to_string(),
+                url: String::new(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        let err = run(&stage, &fs, &console).expect_err("empty url -> err");
+        match err {
+            Error::Multi(errs) => assert_eq!(errs.len(), 1),
+            other => panic!("expected Multi, got {other:?}"),
+        }
+        assert!(!fs.exists(Path::new("/d/foo")));
+    }
+
+    #[test]
+    fn nested_dir_is_created_before_write() {
+        // Path has multiple non-existent parents — mkdir_all should create
+        // them and write the body.
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/nested")
+            .with_status(200)
+            .with_body("payload")
+            .create();
+        let stage = Stage {
+            downloads: vec![Download {
+                path: "/a/b/c/d/nested-file".to_string(),
+                url: format!("{}/nested", server.url()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        run(&stage, &fs, &console).expect("ok");
+
+        assert!(fs.exists(Path::new("/a/b/c/d")));
+        let got = fs.read(Path::new("/a/b/c/d/nested-file")).unwrap();
+        assert_eq!(got, b"payload");
+    }
+
+    #[test]
+    fn http_302_redirect_is_followed() {
+        // reqwest follows up to N redirects by default. Mock a redirect
+        // from /redir -> /dest and verify the final body lands.
+        let mut server = mockito::Server::new();
+        let dest_path = "/dest";
+        let _m_dest = server
+            .mock("GET", dest_path)
+            .with_status(200)
+            .with_body("FINAL")
+            .create();
+        let redir_target = format!("{}{}", server.url(), dest_path);
+        let _m_redir = server
+            .mock("GET", "/redir")
+            .with_status(302)
+            .with_header("Location", &redir_target)
+            .create();
+
+        let stage = Stage {
+            downloads: vec![Download {
+                path: "/got".to_string(),
+                url: format!("{}/redir", server.url()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        run(&stage, &fs, &console).expect("redirect followed");
+
+        let body = fs.read(Path::new("/got")).expect("body written");
+        assert_eq!(body, b"FINAL");
+    }
+
+    #[test]
+    fn http_basic_auth_via_url_is_honoured() {
+        // user:pass embedded in URL is passed in the Authorization header
+        // by reqwest. We don't have a great way to inspect headers via
+        // mockito without setting an explicit matcher, but we can ensure
+        // the request succeeds and the body is captured.
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/secret")
+            .match_header("authorization", mockito::Matcher::Regex("Basic .+".to_string()))
+            .with_status(200)
+            .with_body("authed")
+            .create();
+
+        // Inject userinfo into URL — mockito's matcher confirms the header.
+        let base = server.url();
+        // base looks like "http://127.0.0.1:port"; splice "user:pass@" after scheme.
+        let url = base.replacen("http://", "http://user:pass@", 1) + "/secret";
+
+        let stage = Stage {
+            downloads: vec![Download {
+                path: "/secret-out".to_string(),
+                url,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        run(&stage, &fs, &console).expect("basic auth fetch ok");
+        let body = fs.read(Path::new("/secret-out")).expect("written");
+        assert_eq!(body, b"authed");
+    }
+
+    #[test]
+    fn timeout_zero_uses_default_30s() {
+        // Validate `timeout: 0` does NOT short-circuit to a zero-timeout
+        // client (which would refuse every request). Instead it should
+        // default to DEFAULT_TIMEOUT_SECS (30s) — a fast mock response
+        // therefore succeeds.
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/zero")
+            .with_status(200)
+            .with_body("ok")
+            .create();
+        let stage = Stage {
+            downloads: vec![Download {
+                path: "/zero-out".to_string(),
+                url: format!("{}/zero", server.url()),
+                timeout: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        run(&stage, &fs, &console).expect("timeout 0 -> default 30s");
+        assert_eq!(fs.read(Path::new("/zero-out")).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn multiple_downloads_to_same_parent_dir_all_succeed() {
+        // Smoke test exercising the per-download mkdir_all on the same
+        // parent path repeatedly — must not error on the second.
+        let mut server = mockito::Server::new();
+        let _m1 = server
+            .mock("GET", "/a")
+            .with_status(200)
+            .with_body("A")
+            .create();
+        let _m2 = server
+            .mock("GET", "/b")
+            .with_status(200)
+            .with_body("B")
+            .create();
+        let stage = Stage {
+            downloads: vec![
+                Download {
+                    path: "/d/a".to_string(),
+                    url: format!("{}/a", server.url()),
+                    ..Default::default()
+                },
+                Download {
+                    path: "/d/b".to_string(),
+                    url: format!("{}/b", server.url()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        run(&stage, &fs, &console).expect("ok");
+        assert_eq!(fs.read(Path::new("/d/a")).unwrap(), b"A");
+        assert_eq!(fs.read(Path::new("/d/b")).unwrap(), b"B");
+    }
+
+    #[test]
+    fn permissions_set_to_executable() {
+        // Mode-aware downloads: ensure non-default permissions (0o755) are
+        // recorded by the Vfs.
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/bin")
+            .with_status(200)
+            .with_body("#!/bin/sh\nexit 0\n")
+            .create();
+        let stage = Stage {
+            downloads: vec![Download {
+                path: "/usr/local/bin/foo".to_string(),
+                url: format!("{}/bin", server.url()),
+                permissions: 0o755,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        run(&stage, &fs, &console).expect("ok");
+        let meta = fs.metadata(Path::new("/usr/local/bin/foo")).unwrap();
+        assert_eq!(meta.mode & 0o777, 0o755, "exec bits should be set");
+    }
 }

@@ -1,6 +1,33 @@
-//! `DefaultExecutor` — port of `pkg/executor/default.go`.
+//! [`DefaultExecutor`] — production [`Executor`] implementation.
 //!
-//! Differences from the Go version, with justification:
+//! Build with [`DefaultExecutor::new`] for the wired-up production
+//! executor (every plugin and conditional from upstream yip registered),
+//! or with [`DefaultExecutor::empty`] for tests that want to inject a
+//! controlled subset.
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use yip::console::StandardConsole;
+//! use yip::executor::{DefaultExecutor, Executor};
+//! use yip::vfs::RealVfs;
+//!
+//! let exec = DefaultExecutor::new();
+//! exec.run("rootfs", &RealVfs::new(), &StandardConsole::new(), &[]).unwrap();
+//! ```
+//!
+//! Custom plugin set for a test:
+//!
+//! ```
+//! use std::sync::Arc;
+//! use yip::executor::{DefaultExecutor, Plugin};
+//!
+//! let p: Plugin = Arc::new(|_st, _fs, _con| Ok(()));
+//! let exec = DefaultExecutor::empty().with_plugin("noop", p);
+//! assert_eq!(exec.plugins.len(), 1);
+//! ```
+//!
+//! # Port notes — differences from `pkg/executor/default.go`
 //!
 //! 1. **DAG**: yip uses `spectrocloud-labs/herd` for its DAG; we use
 //!    `petgraph` + a hand-rolled topological walk. yip doesn't use weak
@@ -28,6 +55,12 @@
 //! 5. **stillAlive ticker**: Go spawns a goroutine to log "still running"
 //!    every 10s. Skipped — `tracing` spans give us the same observability
 //!    without an extra thread per plugin.
+//!
+//! # Stability
+//!
+//! Public API. Constructor and builder methods are stable; field layout
+//! (`plugins` / `conditionals` / `modifier`) is also public — treat them
+//! as read-only after construction.
 
 use std::collections::HashSet;
 use std::fs;
@@ -50,8 +83,22 @@ use super::executor::{Conditional, ConditionalOutcome, Executor, Plugin};
 ///
 /// Build with [`DefaultExecutor::new`] for the production wiring (all the
 /// upstream yip plugins) or [`DefaultExecutor::empty`] for tests.
+///
+/// # Examples
+///
+/// ```
+/// use yip::executor::DefaultExecutor;
+///
+/// let exec = DefaultExecutor::empty();
+/// assert_eq!(exec.plugins.len(), 0);
+/// assert_eq!(exec.conditionals.len(), 0);
+/// ```
 pub struct DefaultExecutor {
+    /// Registered action plugins, in registration (= execution) order.
+    /// Each entry is `(name, callback)`.
     pub plugins: Vec<(String, Plugin)>,
+    /// Registered conditionals, in registration order. Evaluated in
+    /// sequence; the first `Skip` or error short-circuits the stage.
     pub conditionals: Vec<(String, Conditional)>,
     /// Optional pre-parse modifier (e.g. `dot_notation_modifier`). Applied
     /// to every raw config blob before YAML parsing.
@@ -61,6 +108,21 @@ pub struct DefaultExecutor {
 impl DefaultExecutor {
     /// Construct an executor with the default plugin + conditional set
     /// (matches Go `NewExecutor()`).
+    ///
+    /// The defaults include all 7 conditionals and 22 plugins required to
+    /// run any upstream yip config. Use [`DefaultExecutor::empty`] +
+    /// [`DefaultExecutor::with_plugin`] for tests that need a controlled
+    /// subset.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use yip::executor::DefaultExecutor;
+    ///
+    /// let exec = DefaultExecutor::new();
+    /// assert!(exec.plugins.len() > 0);
+    /// assert!(exec.conditionals.len() > 0);
+    /// ```
     pub fn new() -> Self {
         Self::empty()
             .with_modifier(Arc::new(|bytes: &[u8]| {
@@ -99,6 +161,16 @@ impl DefaultExecutor {
 
     /// Construct an empty executor; useful for tests that want to inject
     /// specific plugins without the default chain.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use yip::executor::DefaultExecutor;
+    ///
+    /// let exec = DefaultExecutor::empty();
+    /// assert!(exec.plugins.is_empty());
+    /// assert!(exec.modifier.is_none());
+    /// ```
     pub fn empty() -> Self {
         Self {
             plugins: Vec::new(),
@@ -108,6 +180,17 @@ impl DefaultExecutor {
     }
 
     /// Register a plugin. Order matters — plugins run in registration order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use yip::executor::{DefaultExecutor, Plugin};
+    ///
+    /// let p: Plugin = Arc::new(|_st, _fs, _con| Ok(()));
+    /// let exec = DefaultExecutor::empty().with_plugin("noop", p);
+    /// assert_eq!(exec.plugins.len(), 1);
+    /// ```
     pub fn with_plugin(mut self, name: &str, p: Plugin) -> Self {
         self.plugins.push((name.to_string(), p));
         self
@@ -115,12 +198,40 @@ impl DefaultExecutor {
 
     /// Register a conditional. Order matters — conditionals run in
     /// registration order until one returns `Skip`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use yip::executor::{Conditional, ConditionalOutcome, DefaultExecutor};
+    ///
+    /// let c: Conditional = Arc::new(|_st, _fs, _con| Ok(ConditionalOutcome::Run));
+    /// let exec = DefaultExecutor::empty().with_conditional("always", c);
+    /// assert_eq!(exec.conditionals.len(), 1);
+    /// ```
     pub fn with_conditional(mut self, name: &str, c: Conditional) -> Self {
         self.conditionals.push((name.to_string(), c));
         self
     }
 
     /// Replace the pre-parse modifier.
+    ///
+    /// The modifier runs on the raw bytes of every config blob *after*
+    /// template rendering and *before* YAML parsing. The default impl
+    /// (installed by [`DefaultExecutor::new`]) is the
+    /// `dot_notation_modifier`, which expands `stages.foo.commands`-style
+    /// dotted keys into nested maps.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use yip::executor::DefaultExecutor;
+    ///
+    /// let exec = DefaultExecutor::empty()
+    ///     .with_modifier(Arc::new(|b| Ok(b.to_vec())));
+    /// assert!(exec.modifier.is_some());
+    /// ```
     pub fn with_modifier(
         mut self,
         m: Arc<dyn Fn(&[u8]) -> Result<Vec<u8>> + Send + Sync>,
@@ -870,5 +981,781 @@ stages:
     fn default_executor_registers_all_conditionals() {
         let exec = DefaultExecutor::new();
         assert_eq!(exec.conditionals.len(), 7, "expected 7 conditionals, got {}", exec.conditionals.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // Ported from Go `pkg/executor/default_test.go` — additional cases.
+    // -----------------------------------------------------------------------
+
+    /// Mirrors Go: `rootfs.before` runs in its own substage; iterating `rootfs`
+    /// should run before, main, then after — in that order.
+    #[test]
+    fn go_multiple_instructions_substages_ordered() {
+        let yaml = r#"
+name: "Rootfs Layout Settings"
+stages:
+  rootfs.before:
+    - name: "before rootfs"
+  rootfs:
+    - name: "rootfs"
+    - name: "rootfs 2"
+  initramfs:
+    - name: "initramfs"
+"#;
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let exec = DefaultExecutor::empty()
+            .with_plugin("log", recording_plugin(log.clone(), "p"));
+        let c = cfg(yaml);
+        exec.apply("rootfs", &c, &RealVfs::new(), &NullConsole).unwrap();
+        let l = log.lock().unwrap();
+        assert_eq!(
+            *l,
+            vec![
+                "p:before rootfs".to_string(),
+                "p:rootfs".to_string(),
+                "p:rootfs 2".to_string(),
+            ]
+        );
+    }
+
+    /// Mirrors Go: 4 unnamed steps in the same stage — they should NOT merge.
+    #[test]
+    fn go_unnamed_steps_in_sequence_do_not_merge() {
+        let yaml = r#"
+stages:
+  initramfs:
+    - commands: ["a"]
+    - commands: ["b"]
+    - commands: ["c"]
+    - commands: ["d"]
+"#;
+        let counter = Arc::new(AtomicUsize::new(0));
+        let exec = DefaultExecutor::empty()
+            .with_plugin("count", counter_plugin(counter.clone()));
+        let c = cfg(yaml);
+        exec.apply("initramfs", &c, &RealVfs::new(), &NullConsole).unwrap();
+        // 4 stages → 4 plugin invocations.
+        assert_eq!(counter.load(Ordering::SeqCst), 4);
+    }
+
+    /// Mirrors Go: duplicate names must not collapse to one op; the executor
+    /// disambiguates them in the DAG.
+    #[test]
+    fn go_duplicate_named_stages_do_not_merge() {
+        let yaml = r#"
+stages:
+  initramfs:
+    - name: "Create Kairos User"
+      commands: ["a"]
+    - commands: ["b"]
+    - name: "Create Kairos User"
+      commands: ["c"]
+    - commands: ["d"]
+"#;
+        let counter = Arc::new(AtomicUsize::new(0));
+        let exec = DefaultExecutor::empty()
+            .with_plugin("count", counter_plugin(counter.clone()));
+        let c = cfg(yaml);
+        // Apply runs in declaration order (no DAG); we just need 4 invocations.
+        exec.apply("initramfs", &c, &RealVfs::new(), &NullConsole).unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 4);
+    }
+
+    /// Mirrors Go "has multiple instructions in different files": analyze a
+    /// directory and verify the ordered op-name list.
+    #[test]
+    fn go_multiple_files_aggregate_in_order() {
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let exec = DefaultExecutor::empty()
+            .with_plugin("log", recording_plugin(log.clone(), "p"));
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("01_first.yaml"),
+            r#"
+name: "Rootfs Layout Settings"
+stages:
+  rootfs.before:
+    - name: "before roots"
+  rootfs:
+    - name: "rootfs"
+    - name: "rootfs 2"
+  initramfs:
+    - name: "initramfs"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("02_second.yaml"),
+            r#"
+name: "second Rootfs Layout Settings"
+stages:
+  rootfs.before:
+    - name: "second before roots"
+  rootfs:
+    - name: "second rootfs"
+    - name: "second rootfs 2"
+  initramfs:
+    - name: "second initramfs"
+"#,
+        )
+        .unwrap();
+
+        let path_str = dir.path().display().to_string();
+        exec.run("rootfs", &RealVfs::new(), &NullConsole, &[path_str])
+            .unwrap();
+
+        // For substage `rootfs`, the expected ordering pulls the .before
+        // entries first, then the main rootfs stages.
+        let l = log.lock().unwrap();
+        let pos = |needle: &str| l.iter().position(|s| s.ends_with(needle));
+        // Files are walked lexicographically; within a file, .before runs
+        // before the main stage.
+        assert!(pos("before roots").unwrap() < pos("rootfs").unwrap());
+        assert!(pos("second before roots").unwrap() < pos("second rootfs").unwrap());
+        // 01_first comes before 02_second.
+        assert!(pos("rootfs").unwrap() < pos("second rootfs").unwrap());
+    }
+
+    /// Mirrors Go "Skip with if conditionals" — but at the plugin level we
+    /// only test that an empty `if` doesn't break the chain. The conditional
+    /// runtime is covered elsewhere; here we just exercise the apply loop.
+    #[test]
+    fn empty_if_string_does_not_skip() {
+        let yaml = r#"
+stages:
+  rootfs:
+    - name: a
+      if: ""
+"#;
+        let counter = Arc::new(AtomicUsize::new(0));
+        let exec = DefaultExecutor::empty()
+            .with_plugin("count", counter_plugin(counter.clone()));
+        let c = cfg(yaml);
+        exec.apply("rootfs", &c, &RealVfs::new(), &NullConsole).unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    /// Conditional that returns Run → plugins run.
+    #[test]
+    fn conditional_run_allows_plugins() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let exec = DefaultExecutor::empty()
+            .with_conditional("always", const_conditional(ConditionalOutcome::Run))
+            .with_plugin("count", counter_plugin(counter.clone()));
+        let c = cfg(ONE_STAGE_YAML);
+        exec.apply("rootfs", &c, &RealVfs::new(), &NullConsole).unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    /// Conditional that errors → stage is skipped (same as `Skip` outcome).
+    #[test]
+    fn conditional_error_is_treated_as_skip() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let erroring: Conditional =
+            Arc::new(|_s, _f, _c| Err(Error::other("conditional boom")));
+        let exec = DefaultExecutor::empty()
+            .with_conditional("bad", erroring)
+            .with_plugin("count", counter_plugin(counter.clone()));
+        let c = cfg(ONE_STAGE_YAML);
+        let res = exec.apply("rootfs", &c, &RealVfs::new(), &NullConsole);
+        // Conditional errors do not propagate; the stage is just skipped.
+        assert!(res.is_ok(), "expected ok, got {res:?}");
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    /// Multiple conditionals: any Skip → no plugins. Order matters — we stop
+    /// at the first Skip, but the final observable behaviour is the same.
+    #[test]
+    fn first_skip_stops_conditional_chain() {
+        let after_called = Arc::new(AtomicUsize::new(0));
+        let after_called_clone = after_called.clone();
+        let after: Conditional = Arc::new(move |_s, _f, _c| {
+            after_called_clone.fetch_add(1, Ordering::SeqCst);
+            Ok(ConditionalOutcome::Run)
+        });
+        let counter = Arc::new(AtomicUsize::new(0));
+        let exec = DefaultExecutor::empty()
+            .with_conditional("skip", const_conditional(ConditionalOutcome::Skip))
+            .with_conditional("after", after)
+            .with_plugin("count", counter_plugin(counter.clone()));
+        let c = cfg(ONE_STAGE_YAML);
+        exec.apply("rootfs", &c, &RealVfs::new(), &NullConsole).unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            after_called.load(Ordering::SeqCst),
+            0,
+            "after-Skip conditional must not be invoked"
+        );
+    }
+
+    /// Multierror with 3+ errors aggregates correctly.
+    #[test]
+    fn multierror_aggregates_three_errors() {
+        let exec = DefaultExecutor::empty()
+            .with_plugin("a", failing_plugin("a"))
+            .with_plugin("b", failing_plugin("b"))
+            .with_plugin("c", failing_plugin("c"));
+        let c = cfg(ONE_STAGE_YAML);
+        let err = exec
+            .apply("rootfs", &c, &RealVfs::new(), &NullConsole)
+            .unwrap_err();
+        match err {
+            Error::Multi(v) => assert_eq!(v.len(), 3),
+            other => panic!("expected Multi, got {other:?}"),
+        }
+    }
+
+    /// Multierror with errors across multiple stages aggregates across stages.
+    #[test]
+    fn multierror_aggregates_across_stages() {
+        let yaml = r#"
+stages:
+  rootfs:
+    - name: s1
+    - name: s2
+"#;
+        let exec = DefaultExecutor::empty()
+            .with_plugin("fail", failing_plugin("oops"));
+        let c = cfg(yaml);
+        let err = exec
+            .apply("rootfs", &c, &RealVfs::new(), &NullConsole)
+            .unwrap_err();
+        match err {
+            Error::Multi(v) => assert_eq!(v.len(), 2),
+            other => panic!("expected Multi, got {other:?}"),
+        }
+    }
+
+    /// Single error is returned bare (not wrapped in Multi).
+    #[test]
+    fn single_error_is_not_wrapped_in_multi() {
+        let exec = DefaultExecutor::empty().with_plugin("fail", failing_plugin("oops"));
+        let c = cfg(ONE_STAGE_YAML);
+        let err = exec
+            .apply("rootfs", &c, &RealVfs::new(), &NullConsole)
+            .unwrap_err();
+        // The error is wrapped in Plugin (since run_plugins wraps each).
+        match err {
+            Error::Plugin { .. } => {}
+            other => panic!("expected Plugin, got {other:?}"),
+        }
+    }
+
+    /// `after:` deps: long chain a→b→c→d (b after a, c after b, d after c).
+    #[test]
+    fn after_long_chain_runs_in_order() {
+        let yaml = r#"
+stages:
+  rootfs:
+    - name: d
+      after: [{name: c}]
+    - name: b
+      after: [{name: a}]
+    - name: c
+      after: [{name: b}]
+    - name: a
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("c.yaml");
+        fs::write(&f, yaml).unwrap();
+
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let exec = DefaultExecutor::empty().with_plugin("log", recording_plugin(log.clone(), "p"));
+        exec.run("rootfs", &RealVfs::new(), &NullConsole, &[f.display().to_string()])
+            .unwrap();
+        let l = log.lock().unwrap();
+        let pos = |n: &str| l.iter().position(|s| s.ends_with(n)).expect("ran");
+        assert!(pos(":a") < pos(":b"));
+        assert!(pos(":b") < pos(":c"));
+        assert!(pos(":c") < pos(":d"));
+    }
+
+    /// `after:` deps: diamond a→{b,c}→d.
+    #[test]
+    fn after_diamond_runs_in_topo_order() {
+        let yaml = r#"
+stages:
+  rootfs:
+    - name: d
+      after:
+        - name: b
+        - name: c
+    - name: b
+      after: [{name: a}]
+    - name: c
+      after: [{name: a}]
+    - name: a
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("c.yaml");
+        fs::write(&f, yaml).unwrap();
+
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let exec = DefaultExecutor::empty().with_plugin("log", recording_plugin(log.clone(), "p"));
+        exec.run("rootfs", &RealVfs::new(), &NullConsole, &[f.display().to_string()])
+            .unwrap();
+        let l = log.lock().unwrap();
+        let pos = |n: &str| l.iter().position(|s| s.ends_with(n)).expect("ran");
+        assert!(pos(":a") < pos(":b"));
+        assert!(pos(":a") < pos(":c"));
+        assert!(pos(":b") < pos(":d"));
+        assert!(pos(":c") < pos(":d"));
+    }
+
+    /// `after:` deps: cycle detection — a→b, b→a should error.
+    #[test]
+    fn after_cycle_is_detected() {
+        let yaml = r#"
+stages:
+  rootfs:
+    - name: a
+      after: [{name: b}]
+    - name: b
+      after: [{name: a}]
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("c.yaml");
+        fs::write(&f, yaml).unwrap();
+
+        let exec = DefaultExecutor::empty();
+        let res = exec.run("rootfs", &RealVfs::new(), &NullConsole, &[f.display().to_string()]);
+        assert!(res.is_err(), "expected cycle error");
+    }
+
+    /// Path resolution: stdin sentinel `-` is recognised. We can't actually
+    /// pipe to stdin in a unit test cleanly, but we can verify the dispatcher
+    /// at least attempts the stdin branch by ensuring `resolve_source("-")`
+    /// returns an error only after trying to read (i.e. not "not a file").
+    /// In CI stdin is empty → parse_bytes succeeds → returns empty config.
+    #[test]
+    fn stdin_dash_is_resolved_path() {
+        let exec = DefaultExecutor::empty();
+        // We just want to confirm "-" is special-cased, not what `resolve_source`
+        // returns — it depends on the test runner's stdin. Call via the
+        // executor's run() and accept either Ok or an error that is NOT
+        // "could not resolve source".
+        let res = exec.run("rootfs", &RealVfs::new(), &NullConsole, &["-".to_string()]);
+        if let Err(Error::Other(msg)) = &res {
+            assert!(
+                !msg.contains("could not resolve source"),
+                "stdin sentinel was misrouted: {msg}"
+            );
+        }
+    }
+
+    /// Inline YAML detection: contains `:` and `\n` → parsed as YAML.
+    #[test]
+    fn inline_yaml_is_detected_and_parsed() {
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let exec =
+            DefaultExecutor::empty().with_plugin("log", recording_plugin(log.clone(), "p"));
+        let inline = "stages:\n  rootfs:\n    - name: inline_one\n".to_string();
+        exec.run("rootfs", &RealVfs::new(), &NullConsole, &[inline])
+            .unwrap();
+        let l = log.lock().unwrap();
+        assert!(l.iter().any(|s| s.contains("inline_one")), "got {l:?}");
+    }
+
+    /// Inline YAML heuristic: single-line content without `:` + `\n` is NOT
+    /// inline-yaml, and the resolver should reject it.
+    #[test]
+    fn non_yaml_single_token_is_rejected() {
+        let exec = DefaultExecutor::empty();
+        let res = exec.run("rootfs", &RealVfs::new(), &NullConsole, &["notyaml".to_string()]);
+        assert!(res.is_err(), "single-token non-existent path must error");
+    }
+
+    /// Modifier applied before parse: dot-notation tokens expand to stage YAML.
+    #[test]
+    fn modifier_dot_notation_applied_pre_parse() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let exec = DefaultExecutor::empty()
+            .with_modifier(Arc::new(|b: &[u8]| {
+                crate::schema::dot_notation_modifier(b)
+            }))
+            .with_plugin("count", counter_plugin(counter.clone()));
+
+        // Inline source that LOOKS like dot-notation. We need it to pass the
+        // inline-yaml heuristic (contains `:` and `\n`) — so we use a 2-line
+        // version with embedded newlines as YAML strings.
+        // Easier: write to a file with `.yaml` ext.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("c.yaml");
+        fs::write(&f, "stages.rootfs[0].name=fromDot").unwrap();
+
+        exec.run("rootfs", &RealVfs::new(), &NullConsole, &[f.display().to_string()])
+            .unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    /// Empty stage name → still runs (no-op).
+    #[test]
+    fn empty_stage_name_still_runs() {
+        let yaml = r#"
+stages:
+  rootfs:
+    - commands: []
+"#;
+        let counter = Arc::new(AtomicUsize::new(0));
+        let exec = DefaultExecutor::empty()
+            .with_plugin("count", counter_plugin(counter.clone()));
+        let c = cfg(yaml);
+        exec.apply("rootfs", &c, &RealVfs::new(), &NullConsole).unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    /// Stage with only conditionals + no plugins → still completes (no-op).
+    #[test]
+    fn stage_with_no_plugins_is_ok() {
+        let exec = DefaultExecutor::empty()
+            .with_conditional("always", const_conditional(ConditionalOutcome::Run));
+        let c = cfg(ONE_STAGE_YAML);
+        let res = exec.apply("rootfs", &c, &RealVfs::new(), &NullConsole);
+        assert!(res.is_ok());
+    }
+
+    /// Substage non-recursion: running `rootfs.before` should NOT expand to
+    /// `rootfs.before.before` etc.
+    #[test]
+    fn substages_do_not_expand_recursively() {
+        let yaml = r#"
+stages:
+  rootfs.before:
+    - name: actual_before
+  rootfs.before.before:
+    - name: nested
+"#;
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let exec =
+            DefaultExecutor::empty().with_plugin("log", recording_plugin(log.clone(), "p"));
+        let c = cfg(yaml);
+        exec.apply("rootfs.before", &c, &RealVfs::new(), &NullConsole).unwrap();
+        let l = log.lock().unwrap();
+        // Only `actual_before` should run; the `rootfs.before.before` stage
+        // must NOT have been picked up by a recursive substage expansion.
+        assert!(l.iter().any(|s| s.contains("actual_before")));
+        assert!(!l.iter().any(|s| s.contains("nested")), "got {l:?}");
+    }
+
+    /// Substages: running `rootfs.after` shouldn't run `rootfs.before` or `rootfs`.
+    #[test]
+    fn running_after_substage_does_not_run_main() {
+        let yaml = r#"
+stages:
+  rootfs.before:
+    - name: pre
+  rootfs:
+    - name: main
+  rootfs.after:
+    - name: post
+"#;
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let exec =
+            DefaultExecutor::empty().with_plugin("log", recording_plugin(log.clone(), "p"));
+        let c = cfg(yaml);
+        exec.apply("rootfs.after", &c, &RealVfs::new(), &NullConsole).unwrap();
+        let l = log.lock().unwrap();
+        assert_eq!(*l, vec!["p:post".to_string()]);
+    }
+
+    /// substages_for: `rootfs.before` returns single-element list.
+    #[test]
+    fn substages_for_before_no_expansion() {
+        assert_eq!(substages_for("rootfs.before"), vec!["rootfs.before".to_string()]);
+    }
+
+    /// substages_for: `rootfs.after` returns single-element list.
+    #[test]
+    fn substages_for_after_no_expansion() {
+        assert_eq!(substages_for("rootfs.after"), vec!["rootfs.after".to_string()]);
+    }
+
+    /// substages_for: empty stage name returns one empty element.
+    #[test]
+    fn substages_for_empty_is_single_empty() {
+        assert_eq!(substages_for(""), vec![String::new()]);
+    }
+
+    /// substages_for: ordinary name expands to before/main/after.
+    #[test]
+    fn substages_for_normal_expands_to_three() {
+        assert_eq!(
+            substages_for("boot"),
+            vec!["boot.before".to_string(), "boot".to_string(), "boot.after".to_string()],
+        );
+    }
+
+    /// `apply` iterates in declaration order (not topological).
+    #[test]
+    fn apply_uses_declaration_order_not_topo() {
+        let yaml = r#"
+stages:
+  rootfs:
+    - name: second
+    - name: first
+"#;
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let exec =
+            DefaultExecutor::empty().with_plugin("log", recording_plugin(log.clone(), "p"));
+        let c = cfg(yaml);
+        exec.apply("rootfs", &c, &RealVfs::new(), &NullConsole).unwrap();
+        let l = log.lock().unwrap();
+        assert_eq!(*l, vec!["p:second".to_string(), "p:first".to_string()]);
+    }
+
+    /// Substages: missing substage is a silent no-op.
+    #[test]
+    fn missing_substage_silently_skipped() {
+        let yaml = r#"
+stages:
+  rootfs:
+    - name: only
+"#;
+        let counter = Arc::new(AtomicUsize::new(0));
+        let exec = DefaultExecutor::empty()
+            .with_plugin("count", counter_plugin(counter.clone()));
+        let c = cfg(yaml);
+        // No `rootfs.before` and no `rootfs.after` → just `rootfs` runs.
+        exec.apply("rootfs", &c, &RealVfs::new(), &NullConsole).unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    /// `run` with multiple sources (paths) runs each in order.
+    #[test]
+    fn run_with_multiple_sources_runs_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.yaml");
+        let b = dir.path().join("b.yaml");
+        fs::write(&a, "stages:\n  rootfs:\n    - name: from_a\n").unwrap();
+        fs::write(&b, "stages:\n  rootfs:\n    - name: from_b\n").unwrap();
+
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let exec =
+            DefaultExecutor::empty().with_plugin("log", recording_plugin(log.clone(), "p"));
+        exec.run(
+            "rootfs",
+            &RealVfs::new(),
+            &NullConsole,
+            &[a.display().to_string(), b.display().to_string()],
+        )
+        .unwrap();
+        let l = log.lock().unwrap();
+        let pa = l.iter().position(|s| s.contains("from_a")).unwrap();
+        let pb = l.iter().position(|s| s.contains("from_b")).unwrap();
+        assert!(pa < pb);
+    }
+
+    /// `analyze` returns substage ops in order before→main→after.
+    #[test]
+    fn analyze_returns_substages_in_order() {
+        let c = cfg(SUBSTAGE_YAML);
+        let exec = DefaultExecutor::empty();
+        let names = exec.analyze("rootfs", &c);
+        let pa = names.iter().position(|n| n.ends_with(".a")).expect(".a");
+        let pb = names.iter().position(|n| n.ends_with(".b")).expect(".b");
+        let pc = names.iter().position(|n| n.ends_with(".c")).expect(".c");
+        assert!(pa < pb);
+        assert!(pb < pc);
+    }
+
+    /// Directory walking ignores `.txt`, `.md`, etc.
+    #[test]
+    fn directory_walk_ignores_non_yaml() {
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let exec =
+            DefaultExecutor::empty().with_plugin("log", recording_plugin(log.clone(), "p"));
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.yaml"), "stages:\n  rootfs:\n    - name: ok\n").unwrap();
+        fs::write(dir.path().join("b.txt"), "not yaml").unwrap();
+        fs::write(dir.path().join("c.json"), "{}").unwrap();
+        fs::write(dir.path().join("d.ini"), "[x]").unwrap();
+        exec.run(
+            "rootfs",
+            &RealVfs::new(),
+            &NullConsole,
+            &[dir.path().display().to_string()],
+        )
+        .unwrap();
+        let l = log.lock().unwrap();
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains("ok"));
+    }
+
+    /// Files in a directory are walked lexicographically.
+    #[test]
+    fn directory_walk_is_lexicographic() {
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let exec =
+            DefaultExecutor::empty().with_plugin("log", recording_plugin(log.clone(), "p"));
+        let dir = tempfile::tempdir().unwrap();
+        for (name, label) in &[
+            ("03_third.yaml", "third"),
+            ("01_first.yaml", "first"),
+            ("02_second.yaml", "second"),
+        ] {
+            fs::write(
+                dir.path().join(name),
+                format!("stages:\n  rootfs:\n    - name: {label}\n"),
+            )
+            .unwrap();
+        }
+        exec.run(
+            "rootfs",
+            &RealVfs::new(),
+            &NullConsole,
+            &[dir.path().display().to_string()],
+        )
+        .unwrap();
+        let l = log.lock().unwrap();
+        let pf = l.iter().position(|s| s.contains("first")).unwrap();
+        let ps = l.iter().position(|s| s.contains("second")).unwrap();
+        let pt = l.iter().position(|s| s.contains("third")).unwrap();
+        assert!(pf < ps);
+        assert!(ps < pt);
+    }
+
+    /// looks_like_inline_yaml helper.
+    #[test]
+    fn inline_yaml_heuristic_basic() {
+        assert!(looks_like_inline_yaml("key: value\nother: x"));
+        assert!(!looks_like_inline_yaml("just-a-path"));
+        assert!(!looks_like_inline_yaml("a: b"), "no newline → not inline yaml");
+        assert!(!looks_like_inline_yaml("no_colon\nbut_newline"));
+    }
+
+    /// is_url helper.
+    #[test]
+    fn url_detection() {
+        assert!(is_url("http://x.example/y.yaml"));
+        assert!(is_url("https://x.example/y.yaml"));
+        assert!(!is_url("file:///x"));
+        assert!(!is_url("ftp://x"));
+        assert!(!is_url("/some/path"));
+    }
+
+    /// finish() helper unit tests.
+    #[test]
+    fn finish_empty_is_ok() {
+        let r: Result<()> = finish(Vec::new());
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn finish_single_error_passthrough() {
+        let r = finish(vec![Error::other("only")]);
+        match r {
+            Err(Error::Other(msg)) => assert_eq!(msg, "only"),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finish_multiple_errors_wraps_in_multi() {
+        let r = finish(vec![Error::other("a"), Error::other("b")]);
+        match r {
+            Err(Error::Multi(v)) => assert_eq!(v.len(), 2),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// Plugin errors are wrapped in `Error::Plugin { plugin, source }`.
+    #[test]
+    fn plugin_error_wrap_carries_plugin_name() {
+        let exec = DefaultExecutor::empty().with_plugin("widget", failing_plugin("x"));
+        let c = cfg(ONE_STAGE_YAML);
+        let err = exec
+            .apply("rootfs", &c, &RealVfs::new(), &NullConsole)
+            .unwrap_err();
+        match err {
+            Error::Plugin { plugin, .. } => assert_eq!(plugin, "widget"),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// Multiple plugins all run for one stage (Go: every plugin in the chain
+    /// is invoked even if previous ones succeeded — no short-circuit).
+    #[test]
+    fn all_plugins_invoked_per_stage() {
+        let a = Arc::new(AtomicUsize::new(0));
+        let b = Arc::new(AtomicUsize::new(0));
+        let c_ctr = Arc::new(AtomicUsize::new(0));
+        let exec = DefaultExecutor::empty()
+            .with_plugin("a", counter_plugin(a.clone()))
+            .with_plugin("b", counter_plugin(b.clone()))
+            .with_plugin("c", counter_plugin(c_ctr.clone()));
+        let cfg_ = cfg(ONE_STAGE_YAML);
+        exec.apply("rootfs", &cfg_, &RealVfs::new(), &NullConsole).unwrap();
+        assert_eq!(a.load(Ordering::SeqCst), 1);
+        assert_eq!(b.load(Ordering::SeqCst), 1);
+        assert_eq!(c_ctr.load(Ordering::SeqCst), 1);
+    }
+
+    /// Apply with a stage_key that doesn't exist in the config → no error.
+    #[test]
+    fn apply_missing_stage_is_ok() {
+        let exec = DefaultExecutor::empty();
+        let c = cfg(ONE_STAGE_YAML);
+        let res = exec.apply("not_a_real_stage", &c, &RealVfs::new(), &NullConsole);
+        assert!(res.is_ok());
+    }
+
+    /// `DiskVfs` alias still resolves to `RealVfs`.
+    #[test]
+    fn disk_vfs_alias_resolves() {
+        let _v: DiskVfs = RealVfs::new();
+    }
+
+    /// Conditional + plugin order: plugin doesn't run when conditional says Skip.
+    #[test]
+    fn conditional_skip_short_circuits_chain() {
+        let p1 = Arc::new(AtomicUsize::new(0));
+        let p2 = Arc::new(AtomicUsize::new(0));
+        let exec = DefaultExecutor::empty()
+            .with_conditional("nope", const_conditional(ConditionalOutcome::Skip))
+            .with_plugin("p1", counter_plugin(p1.clone()))
+            .with_plugin("p2", counter_plugin(p2.clone()));
+        let c = cfg(ONE_STAGE_YAML);
+        exec.apply("rootfs", &c, &RealVfs::new(), &NullConsole).unwrap();
+        assert_eq!(p1.load(Ordering::SeqCst), 0);
+        assert_eq!(p2.load(Ordering::SeqCst), 0);
+    }
+
+    /// Stage with `name` containing dots — should still work as a stage name.
+    #[test]
+    fn stage_name_with_dots_preserved() {
+        let yaml = r#"
+stages:
+  rootfs:
+    - name: "my.dotted.stage"
+"#;
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let exec =
+            DefaultExecutor::empty().with_plugin("log", recording_plugin(log.clone(), "p"));
+        let c = cfg(yaml);
+        exec.apply("rootfs", &c, &RealVfs::new(), &NullConsole).unwrap();
+        let l = log.lock().unwrap();
+        assert_eq!(*l, vec!["p:my.dotted.stage".to_string()]);
+    }
+
+    /// Build a stage with both `commands` and `files` populated for the
+    /// command/file count logging path (we just verify it doesn't panic).
+    #[test]
+    fn stage_with_both_files_and_commands_runs() {
+        let yaml = r#"
+stages:
+  rootfs:
+    - name: mixed
+      commands: ["echo hi"]
+      files:
+        - path: /tmp/x
+          content: y
+"#;
+        let counter = Arc::new(AtomicUsize::new(0));
+        let exec = DefaultExecutor::empty()
+            .with_plugin("count", counter_plugin(counter.clone()));
+        let c = cfg(yaml);
+        exec.apply("rootfs", &c, &RealVfs::new(), &NullConsole).unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 }

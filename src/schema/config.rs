@@ -1,8 +1,35 @@
-//! Top-level config types — `Config` is the Rust port of Go's `YipConfig`.
+//! Top-level YAML config types.
 //!
-//! Go has `Source` as a non-yaml metadata field (set after parsing by the
-//! loader). We expose it the same way: present on the struct but
-//! `#[serde(skip)]` so it does not round-trip through YAML.
+//! [`Config`] (alias [`YipConfig`]) is the root document yip parses. It
+//! holds a friendly `name` plus a map of `stages` keyed by stage name —
+//! e.g. `rootfs`, `rootfs.before`, `network.after`, `initramfs`. Each
+//! stage entry is a list of [`Stage`] structs, which carry the actual
+//! actions (files to write, commands to run, packages to install, …).
+//!
+//! ## Loading
+//!
+//! - [`Config::load`] parses raw bytes (already template-rendered).
+//! - [`Config::load_file`] reads a path and tags `source` automatically.
+//! - [`Config::to_string_yaml`] serialises back to canonical YAML.
+//!
+//! The executor calls `load` itself after rendering templates and
+//! applying any pre-parse modifier, so end-users normally don't have to
+//! touch these methods.
+//!
+//! # Examples
+//!
+//! ```
+//! use yip::schema::Config;
+//!
+//! let cfg = Config::load(b"name: demo\nstages:\n  rootfs:\n    - name: hi\n").unwrap();
+//! assert_eq!(cfg.name, "demo");
+//! assert_eq!(cfg.stages["rootfs"].len(), 1);
+//! ```
+//!
+//! # Stability
+//!
+//! Public API. Field names match the YAML keys (via `serde rename`);
+//! changing them is a breaking change.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -12,31 +39,95 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::schema::stage::Stage;
 
+/// Root of a yip YAML document.
+///
+/// Two YAML keys: `name` (a free-form label) and `stages` (a map from
+/// stage key to a list of [`Stage`] structs). Anything else in the YAML
+/// is rejected by `serde` unless `Stage` accepts it.
+///
+/// `source` is metadata set by [`Config::load_file`] (and the executor
+/// when it knows the origin) — it does not round-trip through YAML.
+///
+/// # Examples
+///
+/// ```
+/// use yip::schema::Config;
+///
+/// let cfg = Config::default();
+/// assert!(cfg.name.is_empty());
+/// assert!(cfg.stages.is_empty());
+/// ```
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Config {
-    /// Path or URL this config was loaded from. Not stored in YAML.
+    /// Path or URL this config was loaded from. Not stored in YAML —
+    /// populated by [`Config::load_file`] / by the executor.
     #[serde(skip)]
     pub source: String,
 
+    /// Free-form label for the config. Maps to YAML key `name`.
     #[serde(default, rename = "name", skip_serializing_if = "String::is_empty")]
     pub name: String,
 
+    /// Map of stage key (e.g. `"rootfs"`, `"rootfs.before"`) to the
+    /// ordered list of [`Stage`] entries that run for it. Maps to YAML
+    /// key `stages`.
     #[serde(default, rename = "stages", skip_serializing_if = "HashMap::is_empty")]
     pub stages: HashMap<String, Vec<Stage>>,
 }
 
 /// Go-flavoured alias so a porting reader can still type `YipConfig`.
+///
+/// # Examples
+///
+/// ```
+/// use yip::schema::{Config, YipConfig};
+///
+/// let _: YipConfig = Config::default();
+/// ```
 pub type YipConfig = Config;
 
 impl Config {
-    /// Parse a YAML byte slice into a Config. Mirrors `schema.Load` minus
-    /// the cloud-init detection branch — this is the yip-native YAML path.
+    /// Parse a YAML byte slice into a [`Config`].
+    ///
+    /// Mirrors `schema.Load` from Go yip minus the cloud-init detection
+    /// branch — this is the yip-native YAML path. The caller is
+    /// responsible for template rendering and any pre-parse modifier
+    /// (the executor handles both for you).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Yaml`](crate::error::Error::Yaml) when the bytes
+    /// aren't valid YAML or don't match the schema.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use yip::schema::Config;
+    ///
+    /// let cfg = Config::load(b"name: t\n").unwrap();
+    /// assert_eq!(cfg.name, "t");
+    /// ```
     pub fn load(bytes: &[u8]) -> Result<Self> {
         let cfg: Config = serde_yaml::from_slice(bytes)?;
         Ok(cfg)
     }
 
-    /// Convenience: load from a file path, attaching the path to `source`.
+    /// Load a config from a file path; sets `source` to the path string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`](crate::error::Error::Io) if the file can't
+    /// be read, or [`Error::Yaml`](crate::error::Error::Yaml) if the
+    /// contents don't parse.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use yip::schema::Config;
+    ///
+    /// let cfg = Config::load_file("/etc/yip/conf.yaml").unwrap();
+    /// assert_eq!(cfg.source, "/etc/yip/conf.yaml");
+    /// ```
     pub fn load_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let bytes = std::fs::read(path).map_err(|e| Error::io_at(path, e))?;
@@ -45,7 +136,25 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Serialize to YAML. Mirrors Go's `YipConfig.ToString`.
+    /// Serialise to YAML. Mirrors Go's `YipConfig.ToString`.
+    ///
+    /// Empty fields are skipped (`skip_serializing_if`) so the output is
+    /// minimal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Yaml`](crate::error::Error::Yaml) on serialiser
+    /// failure (rare — usually only happens on cycles).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use yip::schema::Config;
+    ///
+    /// let cfg = Config { name: "t".into(), ..Default::default() };
+    /// let s = cfg.to_string_yaml().unwrap();
+    /// assert!(s.contains("name: t"));
+    /// ```
     pub fn to_string_yaml(&self) -> Result<String> {
         Ok(serde_yaml::to_string(self)?)
     }

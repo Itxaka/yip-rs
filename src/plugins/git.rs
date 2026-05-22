@@ -900,6 +900,209 @@ mod tests {
                 cmds[0]
             );
         }
+
+        // ---- Additional coverage parity with Go's git_test.go ----
+
+        /// A branch name containing `:` must still be shell-quoted into the
+        /// `--branch` arg without breaking the command.
+        #[test]
+        fn branch_with_colon_is_quoted_safely() {
+            let (fs, console) = rc();
+            let stage = Stage {
+                git: Git {
+                    url: "https://example.com/foo.git".into(),
+                    path: "/srv/foo".into(),
+                    branch: "refs/heads/feature:weird".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            run(&stage, &fs, &console).expect("clone");
+            let cmds = console.commands();
+            assert_eq!(cmds.len(), 1);
+            assert!(
+                cmds[0].contains("--branch 'refs/heads/feature:weird'"),
+                "colon-bearing branch quoted: {}",
+                cmds[0]
+            );
+        }
+
+        /// Branch name containing `/` (e.g. `feature/foo`) is the common
+        /// case. Make sure we pass it through intact.
+        #[test]
+        fn branch_with_slash_passes_through() {
+            let (fs, console) = rc();
+            let stage = Stage {
+                git: Git {
+                    url: "https://example.com/foo.git".into(),
+                    path: "/srv/foo".into(),
+                    branch: "feature/foo".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            run(&stage, &fs, &console).expect("clone");
+            assert!(
+                console.commands()[0].contains("--branch 'feature/foo'"),
+                "branch with slash: {}",
+                console.commands()[0]
+            );
+        }
+
+        /// Local destination paths with spaces must be shell-quoted so the
+        /// resulting `git clone` is a single arg.
+        #[test]
+        fn destination_path_with_spaces_is_quoted() {
+            let (fs, console) = rc();
+            let stage = Stage {
+                git: Git {
+                    url: "https://example.com/foo.git".into(),
+                    path: "/srv/my project/foo".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            run(&stage, &fs, &console).expect("clone");
+            let cmds = console.commands();
+            assert_eq!(cmds.len(), 1);
+            assert!(
+                cmds[0].contains("'/srv/my project/foo'"),
+                "path with spaces quoted: {}",
+                cmds[0]
+            );
+        }
+
+        /// `ssh://user@host:2222/repo.git` should pass through unchanged —
+        /// we don't try to rewrite SSH ports. Verify the URL survives
+        /// quoting verbatim.
+        #[test]
+        fn ssh_url_with_non_default_port_passes_through() {
+            let (fs, console) = rc();
+            let stage = Stage {
+                git: Git {
+                    url: "ssh://git@example.com:2222/foo/bar.git".into(),
+                    path: "/srv/foo".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            run(&stage, &fs, &console).expect("clone");
+            let cmds = console.commands();
+            assert!(
+                cmds[0].contains("'ssh://git@example.com:2222/foo/bar.git'"),
+                "ssh port survives: {}",
+                cmds[0]
+            );
+        }
+
+        /// `insecure: true` without a `private_key` is a no-op for auth
+        /// purposes: we should not emit `GIT_SSH_COMMAND` and should not
+        /// inject `StrictHostKeyChecking=no` anywhere — there is no key
+        /// file to point ssh at. Mirrors Go: the insecure flag only
+        /// matters with an explicit SSH key.
+        #[test]
+        fn insecure_without_private_key_is_inert() {
+            let (fs, console) = rc();
+            let stage = Stage {
+                git: Git {
+                    url: "https://example.com/foo.git".into(),
+                    path: "/srv/foo".into(),
+                    auth: Auth {
+                        private_key: "".into(),
+                        insecure: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            run(&stage, &fs, &console).expect("clone");
+            let cmds = console.commands();
+            assert_eq!(cmds.len(), 1);
+            assert!(
+                !cmds[0].contains("GIT_SSH_COMMAND="),
+                "no ssh env without a key: {}",
+                cmds[0]
+            );
+            assert!(
+                !cmds[0].contains("StrictHostKeyChecking"),
+                "no host-key option without a key: {}",
+                cmds[0]
+            );
+        }
+
+        /// `public_key` is documented as "ignored / matches Go binary
+        /// backend". Make sure setting it does NOT alter the produced
+        /// command (no surprise env vars, no extra args).
+        #[test]
+        fn public_key_is_ignored() {
+            let (fs, console) = rc();
+            let baseline = {
+                let (fs, console) = rc();
+                let stage = Stage {
+                    git: Git {
+                        url: "https://example.com/foo.git".into(),
+                        path: "/srv/foo".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                run(&stage, &fs, &console).expect("baseline");
+                console.commands()
+            };
+            let stage = Stage {
+                git: Git {
+                    url: "https://example.com/foo.git".into(),
+                    path: "/srv/foo".into(),
+                    auth: Auth {
+                        public_key: "ssh-rsa AAAA...".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            run(&stage, &fs, &console).expect("clone");
+            assert_eq!(
+                console.commands(),
+                baseline,
+                "public_key must be a no-op for command shape",
+            );
+        }
+
+        /// The yip schema currently lets a stage carry exactly one Git
+        /// block (it's a struct, not a Vec). This test is the "if anyone
+        /// changes that, redesign the plugin" guard: assert that two
+        /// stages must be run separately.
+        #[test]
+        fn single_git_per_stage_assumption() {
+            let (fs, console) = rc();
+            // First stage: clone repo A.
+            let stage_a = Stage {
+                git: Git {
+                    url: "https://example.com/a.git".into(),
+                    path: "/srv/a".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            run(&stage_a, &fs, &console).expect("a");
+            // Second stage: clone repo B (separate run() call).
+            let stage_b = Stage {
+                git: Git {
+                    url: "https://example.com/b.git".into(),
+                    path: "/srv/b".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            run(&stage_b, &fs, &console).expect("b");
+
+            let cmds = console.commands();
+            assert_eq!(cmds.len(), 2, "exactly one clone per run() call: {cmds:?}");
+            assert!(cmds[0].contains("'https://example.com/a.git'"));
+            assert!(cmds[1].contains("'https://example.com/b.git'"));
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1007,6 +1210,114 @@ mod tests {
                 ".git/HEAD should exist: {}",
                 head.display()
             );
+        }
+
+        /// Clone with an explicit branch name into a fresh tempdir. The
+        /// seeded bare repo has `master` as its only ref, so passing
+        /// `branch = "master"` exercises the `with_ref_name(Some(_))`
+        /// path explicitly (the default-branch test above leaves it
+        /// blank and goes through `effective_branch`'s fallback).
+        #[test]
+        fn fresh_clone_with_explicit_branch_against_local_bare_repo() {
+            let src_tmp = tempfile::tempdir().expect("src tempdir");
+            let src_path = src_tmp.path().join("source.git");
+            let url = seed_bare_repo(&src_path);
+
+            let dst_tmp = tempfile::tempdir().expect("dst tempdir");
+            let dst_path = dst_tmp.path().join("checkout");
+
+            let stage = Stage {
+                git: Git {
+                    url,
+                    path: dst_path.to_string_lossy().into_owned(),
+                    branch: "master".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let fs = RealVfs::new();
+            let console = StandardConsole::new();
+            run(&stage, &fs, &console).expect("explicit-branch clone");
+            assert!(
+                dst_path.join(".git").exists(),
+                ".git dir exists for explicit-branch clone",
+            );
+        }
+
+        /// Cloning into a destination that already has a `.git` directory
+        /// must take the "update existing" path, not blow up with a
+        /// "directory not empty" error. Since the seeded source has no
+        /// extra commits to fetch, this should just no-op cleanly.
+        ///
+        /// We verify by clone-then-clone-again: the second invocation
+        /// should succeed and the `.git` directory should still be
+        /// present and openable.
+        #[test]
+        fn second_clone_into_existing_dir_takes_update_path() {
+            let src_tmp = tempfile::tempdir().expect("src tempdir");
+            let src_path = src_tmp.path().join("source.git");
+            let url = seed_bare_repo(&src_path);
+
+            let dst_tmp = tempfile::tempdir().expect("dst tempdir");
+            let dst_path = dst_tmp.path().join("checkout");
+
+            let fs = RealVfs::new();
+            let console = StandardConsole::new();
+
+            let make_stage = || Stage {
+                git: Git {
+                    url: url.clone(),
+                    path: dst_path.to_string_lossy().into_owned(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            // First clone — fresh.
+            run(&make_stage(), &fs, &console).expect("first clone");
+            assert!(dst_path.join(".git").exists(), "first clone wrote .git");
+
+            // Second clone into the same destination — must go through
+            // `update_existing` (the .git marker is detected).
+            run(&make_stage(), &fs, &console).expect("second invocation must succeed");
+            // Sanity check: gix can still open the dir.
+            let _ = gix::open(&dst_path).expect("gix can reopen .git after update");
+        }
+
+        /// Multiple successive clones into *different* paths must all
+        /// succeed. Stresses that the gix backend doesn't keep any
+        /// global state that would conflict between operations
+        /// (mirrors the Go test's "multiple clones" check).
+        #[test]
+        fn multiple_clones_into_separate_paths() {
+            let src_tmp = tempfile::tempdir().expect("src tempdir");
+            let src_path = src_tmp.path().join("source.git");
+            let url = seed_bare_repo(&src_path);
+
+            let dst_tmp = tempfile::tempdir().expect("dst tempdir");
+            let fs = RealVfs::new();
+            let console = StandardConsole::new();
+
+            for sub in &["a", "b", "c"] {
+                let dst_path = dst_tmp.path().join(sub);
+                let stage = Stage {
+                    git: Git {
+                        url: url.clone(),
+                        path: dst_path.to_string_lossy().into_owned(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                run(&stage, &fs, &console).unwrap_or_else(|e| {
+                    panic!("clone {sub} should succeed: {e}");
+                });
+                assert!(
+                    dst_path.join(".git").exists(),
+                    "clone {sub} wrote .git at {}",
+                    dst_path.display(),
+                );
+            }
         }
 
         /// Online smoke test. Disabled by default; run with

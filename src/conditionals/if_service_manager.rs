@@ -189,4 +189,135 @@ mod tests {
         let out = cond(&stage, &fs, &console).unwrap();
         assert_eq!(out, ConditionalOutcome::Run);
     }
+
+    // --- Additional tests ported from Go behaviour expectations ---
+
+    #[test]
+    fn openrc_and_systemd_both_present_init_pid1_picks_openrc() {
+        // The Go test "Fails if it finds both" stat-checks both binaries
+        // and reports SkipBothServices. Our detector instead reads PID 1's
+        // comm: when it's `init`, openrc-run presence wins. This means
+        // both-binaries-present + init pid1 -> openrc (not unknown).
+        let fs = MemVfs::new();
+        fs.write(Path::new("/proc/1/comm"), b"init\n").unwrap();
+        fs.write(Path::new("/sbin/openrc-run"), b"#!/bin/sh\n")
+            .unwrap();
+        // A bogus /sbin/systemctl should not influence the decision.
+        fs.write(Path::new("/sbin/systemctl"), b"#!/bin/sh\n")
+            .unwrap();
+        let console = RecordingConsole::default();
+        let stage = stage_with("openrc");
+        let out = check(&stage, &fs, &console).unwrap();
+        assert_eq!(out, ConditionalOutcome::Run);
+
+        // And the systemd matcher should NOT pick up the host even though
+        // /sbin/systemctl exists — because pid1's comm is `init`.
+        let stage_sd = stage_with("systemd");
+        let out = check(&stage_sd, &fs, &console).unwrap();
+        assert_eq!(out, ConditionalOutcome::Skip);
+    }
+
+    #[test]
+    fn both_binaries_present_with_systemd_pid1_matches_systemd() {
+        // pid1 = systemd, both binaries on disk -> systemd matcher wins.
+        let fs = MemVfs::new();
+        fs.write(Path::new("/proc/1/comm"), b"systemd\n").unwrap();
+        fs.write(Path::new("/sbin/openrc-run"), b"#!/bin/sh\n")
+            .unwrap();
+        fs.write(Path::new("/sbin/systemctl"), b"#!/bin/sh\n")
+            .unwrap();
+        let console = RecordingConsole::default();
+        let stage = stage_with("systemd");
+        let out = check(&stage, &fs, &console).unwrap();
+        assert_eq!(out, ConditionalOutcome::Run);
+    }
+
+    #[test]
+    fn upstart_pid1_is_unknown_and_skips_specific_matchers() {
+        // PID 1 named `init` without openrc-run on disk yields "unknown" —
+        // matches neither systemd nor openrc.
+        let fs = MemVfs::new();
+        fs.write(Path::new("/proc/1/comm"), b"init\n").unwrap();
+        // no /sbin/openrc-run -> "unknown"
+        let console = RecordingConsole::default();
+        // Specific matchers should Skip.
+        assert_eq!(
+            check(&stage_with("systemd"), &fs, &console).unwrap(),
+            ConditionalOutcome::Skip
+        );
+        assert_eq!(
+            check(&stage_with("openrc"), &fs, &console).unwrap(),
+            ConditionalOutcome::Skip
+        );
+        // But the "unknown" matcher itself runs.
+        assert_eq!(
+            check(&stage_with("unknown"), &fs, &console).unwrap(),
+            ConditionalOutcome::Run
+        );
+    }
+
+    #[test]
+    fn runit_pid1_is_treated_as_unknown() {
+        // Any comm that isn't systemd or init -> unknown.
+        let fs = MemVfs::new();
+        fs.write(Path::new("/proc/1/comm"), b"runit\n").unwrap();
+        let console = RecordingConsole::default();
+        assert_eq!(
+            check(&stage_with("runit"), &fs, &console).unwrap(),
+            ConditionalOutcome::Skip
+        );
+        assert_eq!(
+            check(&stage_with("unknown"), &fs, &console).unwrap(),
+            ConditionalOutcome::Run
+        );
+    }
+
+    #[test]
+    fn weird_regex_against_systemd_pid1_skips() {
+        // Direct port of Go's "Fails if not supported".
+        let fs = MemVfs::new();
+        fs.write(Path::new("/proc/1/comm"), b"systemd\n").unwrap();
+        let console = RecordingConsole::default();
+        let stage = stage_with("weird");
+        assert_eq!(
+            check(&stage, &fs, &console).unwrap(),
+            ConditionalOutcome::Skip
+        );
+    }
+
+    #[test]
+    fn comm_with_trailing_whitespace_is_trimmed() {
+        // /proc/1/comm includes a trailing newline on Linux. We strip it
+        // before matching, so a "systemd\n" file matches the literal regex.
+        let fs = MemVfs::new();
+        fs.write(Path::new("/proc/1/comm"), b"systemd\n\n  ").unwrap();
+        let console = RecordingConsole::default();
+        let stage = stage_with("^systemd$");
+        assert_eq!(
+            check(&stage, &fs, &console).unwrap(),
+            ConditionalOutcome::Run
+        );
+    }
+
+    #[test]
+    fn alternation_systemd_or_openrc_matches_either() {
+        let fs = MemVfs::new();
+        fs.write(Path::new("/proc/1/comm"), b"systemd\n").unwrap();
+        let console = RecordingConsole::default();
+        let stage = stage_with("systemd|openrc");
+        assert_eq!(
+            check(&stage, &fs, &console).unwrap(),
+            ConditionalOutcome::Run
+        );
+
+        // Swap to openrc pid1.
+        let fs2 = MemVfs::new();
+        fs2.write(Path::new("/proc/1/comm"), b"init\n").unwrap();
+        fs2.write(Path::new("/sbin/openrc-run"), b"#!/bin/sh\n")
+            .unwrap();
+        assert_eq!(
+            check(&stage, &fs2, &console).unwrap(),
+            ConditionalOutcome::Run
+        );
+    }
 }

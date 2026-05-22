@@ -739,4 +739,211 @@ mod tests {
         let p = build_delete();
         p(&Stage::default(), &fs, &con).unwrap();
     }
+
+    // -------------------------------------------------------------------
+    // Ported from Go: shadow 9-field round trip, gshadow, group members,
+    // delete for groups + shadow, combined ensure + delete in one stage.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn ensure_shadow_full_nine_fields_round_trip() {
+        // All nine fields populated. Render order: username:password:
+        // last:min:max:warn:inactive:expire:reserved.
+        let fs = MemVfs::new();
+        let con = RecordingConsole::default();
+        let stage = Stage {
+            ensure_entities: vec![YipEntity {
+                path: "/etc/shadow".into(),
+                entity: indoc! {r#"
+                    kind: shadow
+                    username: alice
+                    password: "$6$abc$def"
+                    last_changed: "19000"
+                    minimum_changed: "0"
+                    maximum_changed: "99999"
+                    warn: "7"
+                    inactive: "14"
+                    expire: "20000"
+                    reserved: "x"
+                "#}
+                .into(),
+            }],
+            ..Default::default()
+        };
+        run(&stage, &fs, &con).unwrap();
+        let out = read(&fs, "/etc/shadow");
+        assert!(
+            out.contains("alice:$6$abc$def:19000:0:99999:7:14:20000:x"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_gshadow_entry_renders_four_fields() {
+        // gshadow format: name:password:administrators:members
+        let fs = MemVfs::new();
+        let con = RecordingConsole::default();
+        let stage = Stage {
+            ensure_entities: vec![YipEntity {
+                path: "/etc/gshadow".into(),
+                entity: indoc! {r#"
+                    kind: gshadow
+                    name: wheel
+                    password: "!"
+                    administrators: root,alice
+                    members: bob,carol
+                "#}
+                .into(),
+            }],
+            ..Default::default()
+        };
+        run(&stage, &fs, &con).unwrap();
+        let out = read(&fs, "/etc/gshadow");
+        assert_eq!(out, "wheel:!:root,alice:bob,carol\n");
+    }
+
+    #[test]
+    fn ensure_group_with_member_list() {
+        // Group with a populated members list; verify the comma-separated
+        // members field is preserved as a single colon-delimited segment.
+        let fs = MemVfs::new();
+        let con = RecordingConsole::default();
+        write(&fs, "/etc/group", "root:x:0:\n");
+
+        let stage = Stage {
+            ensure_entities: vec![YipEntity {
+                path: "/etc/group".into(),
+                entity: indoc! {r#"
+                    kind: group
+                    group_name: devs
+                    password: x
+                    gid: 1500
+                    users: alice,bob,carol,dave
+                "#}
+                .into(),
+            }],
+            ..Default::default()
+        };
+        run(&stage, &fs, &con).unwrap();
+        let out = read(&fs, "/etc/group");
+        assert!(out.contains("devs:x:1500:alice,bob,carol,dave\n"), "got: {out}");
+        // Still has root.
+        assert!(out.starts_with("root:x:0:\n"));
+    }
+
+    #[test]
+    fn delete_group_entry_removes_only_that_line() {
+        let fs = MemVfs::new();
+        let con = RecordingConsole::default();
+        write(
+            &fs,
+            "/etc/group",
+            "root:x:0:\nwheel:x:10:alice\ndevs:x:1500:alice,bob\n",
+        );
+
+        let stage = Stage {
+            delete_entities: vec![YipEntity {
+                path: "/etc/group".into(),
+                entity: indoc! {r#"
+                    kind: group
+                    group_name: wheel
+                    password: x
+                    gid: 10
+                    users: alice
+                "#}
+                .into(),
+            }],
+            ..Default::default()
+        };
+        run_delete(&stage, &fs, &con).unwrap();
+        let out = read(&fs, "/etc/group");
+        assert_eq!(out, "root:x:0:\ndevs:x:1500:alice,bob\n");
+    }
+
+    #[test]
+    fn delete_shadow_entry_removes_matching_line() {
+        let fs = MemVfs::new();
+        let con = RecordingConsole::default();
+        write(
+            &fs,
+            "/etc/shadow",
+            "root:!:19000:0:99999:7:::\nalice:$6$abc$def:19000:0:99999:7:::\n",
+        );
+
+        let stage = Stage {
+            delete_entities: vec![YipEntity {
+                path: "/etc/shadow".into(),
+                entity: indoc! {r#"
+                    kind: shadow
+                    username: alice
+                    password: "$6$abc$def"
+                    last_changed: "19000"
+                    minimum_changed: "0"
+                    maximum_changed: "99999"
+                    warn: "7"
+                    inactive: ""
+                    expire: ""
+                    reserved: ""
+                "#}
+                .into(),
+            }],
+            ..Default::default()
+        };
+        run_delete(&stage, &fs, &con).unwrap();
+        let out = read(&fs, "/etc/shadow");
+        assert_eq!(out, "root:!:19000:0:99999:7:::\n");
+        assert!(!out.contains("alice"));
+    }
+
+    #[test]
+    fn combined_ensure_and_delete_in_same_stage() {
+        // Same stage carries both ensure_entities AND delete_entities.
+        // Running ensure then delete (mirrors the two-plugin DAG hookup)
+        // must produce a file with the new entry and without the old one.
+        let fs = MemVfs::new();
+        let con = RecordingConsole::default();
+        write(&fs, "/etc/passwd", "root:x:0:0::/root:/bin/sh\nold:x:99:99:O:/h:/sh\n");
+
+        let stage = Stage {
+            ensure_entities: vec![YipEntity {
+                path: "/etc/passwd".into(),
+                entity: indoc! {r#"
+                    kind: user
+                    username: new
+                    password: x
+                    uid: 100
+                    gid: 100
+                    info: N
+                    homedir: /home/new
+                    shell: /bin/bash
+                "#}
+                .into(),
+            }],
+            delete_entities: vec![YipEntity {
+                path: "/etc/passwd".into(),
+                entity: indoc! {r#"
+                    kind: user
+                    username: old
+                    password: x
+                    uid: 99
+                    gid: 99
+                    info: O
+                    homedir: /h
+                    shell: /sh
+                "#}
+                .into(),
+            }],
+            ..Default::default()
+        };
+
+        // Apply ensure first, then delete — same dispatch order as the
+        // executor wires the two actions.
+        run(&stage, &fs, &con).unwrap();
+        run_delete(&stage, &fs, &con).unwrap();
+
+        let out = read(&fs, "/etc/passwd");
+        assert!(out.contains("root:x:0:0::/root:/bin/sh\n"));
+        assert!(out.contains("new:x:100:100:N:/home/new:/bin/bash"));
+        assert!(!out.contains("old:x:99:99:O:/h:/sh"));
+    }
 }

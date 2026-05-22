@@ -400,4 +400,133 @@ mod tests {
         assert_eq!(decode_content("hi", "text").unwrap(), b"hi");
         assert_eq!(decode_content("hi", "plain").unwrap(), b"hi");
     }
+
+    // -------------------------------------------------------------------
+    // Ported from Go: extra encoding paths, owner_string warn, perm round
+    // trips, large content, tilde/$HOME literal handling.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn b64_plus_gz_alias_works() {
+        // "b64+gz" should be equivalent to "gz+b64": base64 first, then gzip.
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let payload = b"alt-alias-roundtrip";
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(payload).unwrap();
+        let gz = enc.finish().unwrap();
+        let b64 = BASE64_STANDARD.encode(&gz);
+
+        let stage = Stage {
+            files: vec![File {
+                path: "/aliased".to_string(),
+                content: b64,
+                encoding: "b64+gz".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        run(&stage, &fs, &console).expect("write should succeed");
+        assert_eq!(fs.read(Path::new("/aliased")).unwrap(), payload);
+    }
+
+    #[test]
+    fn owner_string_field_skipped_with_warn_no_panic() {
+        // Cloud-init style: owner is filled into the dedicated `owner_string`
+        // field. Plugin must NOT panic and must NOT chown — it logs a warn.
+        let stage = Stage {
+            files: vec![File {
+                path: "/ostr".to_string(),
+                content: "x".to_string(),
+                owner_string: "alice".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        run(&stage, &fs, &console).expect("owner_string warn path must not error");
+        let m = fs.metadata(Path::new("/ostr")).expect("metadata");
+        assert_eq!((m.uid, m.gid), (0, 0));
+    }
+
+    fn write_with_perm(perm: u32) {
+        let path = format!("/perm/{:o}", perm);
+        let stage = Stage {
+            files: vec![File {
+                path: path.clone(),
+                content: "x".to_string(),
+                permissions: perm,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        run(&stage, &fs, &console).expect("write ok");
+        let m = fs.metadata(Path::new(&path)).expect("metadata");
+        assert_eq!(m.mode, perm, "round-trip mode for {:o}", perm);
+    }
+
+    #[test]
+    fn permissions_round_trip_via_memvfs() {
+        // Each perm written and read back through MemVfs metadata.
+        write_with_perm(0o600);
+        write_with_perm(0o755);
+        write_with_perm(0o777);
+    }
+
+    #[test]
+    fn large_content_above_one_mib_writes_intact() {
+        // > 1 MiB blob — ensure no truncation, no surprise reallocation bug.
+        let big_size = 1024 * 1024 + 17; // just over 1 MiB
+        let blob: Vec<u8> = (0..big_size).map(|i| (i % 251) as u8).collect();
+        let content = String::from_utf8(blob.iter().map(|&b| (b % 64) + b'0').collect()).unwrap();
+        let stage = Stage {
+            files: vec![File {
+                path: "/big".to_string(),
+                content: content.clone(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        run(&stage, &fs, &console).expect("large write ok");
+        let got = fs.read(Path::new("/big")).expect("read big");
+        assert_eq!(got.len(), content.len());
+        assert_eq!(got, content.as_bytes());
+    }
+
+    #[test]
+    fn tilde_and_dollarhome_paths_are_literal_not_expanded() {
+        // Go behaviour: yip does not expand `~` or `$HOME`; the path is
+        // written as-is. Same here.
+        let stage = Stage {
+            files: vec![
+                File {
+                    path: "/~/literal".to_string(),
+                    content: "tilde".to_string(),
+                    ..Default::default()
+                },
+                File {
+                    path: "/$HOME/literal".to_string(),
+                    content: "dollar".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        run(&stage, &fs, &console).expect("ok");
+        assert!(fs.exists(Path::new("/~/literal")));
+        assert!(fs.exists(Path::new("/$HOME/literal")));
+        assert_eq!(fs.read(Path::new("/~/literal")).unwrap(), b"tilde");
+        assert_eq!(fs.read(Path::new("/$HOME/literal")).unwrap(), b"dollar");
+    }
 }

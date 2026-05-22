@@ -514,4 +514,179 @@ mod tests {
         plugin(&stage_install(&["foo"]), &fs, &console).unwrap();
         assert_eq!(console.commands(), vec!["apt-get -y install foo".to_string()]);
     }
+
+    // --- Additional tests ported from Go behaviour expectations ---
+
+    #[test]
+    fn apt_refresh_then_install_in_correct_order() {
+        // Refresh + install in same stage: refresh must run before install.
+        let fs = MemVfs::new();
+        write_os_release(&fs, "ID=ubuntu\n");
+        let console = RecordingConsole::new();
+        let stage = Stage {
+            packages: Packages {
+                install: vec!["vim".into()],
+                refresh: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        run(&stage, &fs, &console).expect("ok");
+        assert_eq!(
+            console.commands(),
+            vec![
+                "apt-get update".to_string(),
+                "apt-get -y install vim".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn dnf_upgrade_only() {
+        // Only upgrade set — no install/remove/refresh.
+        let fs = MemVfs::new();
+        write_os_release(&fs, "ID=fedora\n");
+        let console = RecordingConsole::new();
+        let stage = Stage {
+            packages: Packages {
+                upgrade: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        run(&stage, &fs, &console).expect("ok");
+        assert_eq!(
+            console.commands(),
+            vec!["dnf -y upgrade".to_string()]
+        );
+    }
+
+    #[test]
+    fn apk_install_with_version_pin_in_name() {
+        // The `install` list can contain entries like `pkg=1.2.3` which apk
+        // accepts natively. We pass these through unchanged.
+        let fs = MemVfs::new();
+        write_os_release(&fs, "ID=alpine\n");
+        let console = RecordingConsole::new();
+        let stage = Stage {
+            packages: Packages {
+                install: vec!["foo=1.2.3".into(), "bar".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        run(&stage, &fs, &console).expect("ok");
+        assert_eq!(
+            console.commands(),
+            vec!["apk add foo=1.2.3 bar".to_string()]
+        );
+    }
+
+    #[test]
+    fn refresh_only_no_install_runs_just_refresh() {
+        // Empty install list + refresh: just the refresh command should
+        // fire.
+        let fs = MemVfs::new();
+        write_os_release(&fs, "ID=ubuntu\n");
+        let console = RecordingConsole::new();
+        let stage = Stage {
+            packages: Packages {
+                refresh: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        run(&stage, &fs, &console).expect("ok");
+        assert_eq!(console.commands(), vec!["apt-get update".to_string()]);
+    }
+
+    #[test]
+    fn combined_refresh_upgrade_install_remove_apt_order() {
+        // All four actions: refresh -> upgrade -> install -> remove.
+        // (`full_action_order_on_apt` already covers this for debian; we
+        // re-check for ubuntu to be explicit and to differ in package list
+        // contents.)
+        let fs = MemVfs::new();
+        write_os_release(&fs, "ID=ubuntu\n");
+        let console = RecordingConsole::new();
+        let stage = Stage {
+            packages: Packages {
+                install: vec!["vim".into()],
+                remove: vec!["nano".into()],
+                refresh: true,
+                upgrade: true,
+            },
+            ..Default::default()
+        };
+        run(&stage, &fs, &console).expect("ok");
+        assert_eq!(
+            console.commands(),
+            vec![
+                "apt-get update".to_string(),
+                "apt-get -y upgrade".to_string(),
+                "apt-get -y install vim".to_string(),
+                "apt-get -y remove nano".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn combined_refresh_upgrade_install_remove_dnf_order() {
+        // Same scenario, dnf side.
+        let fs = MemVfs::new();
+        write_os_release(&fs, "ID=fedora\n");
+        let console = RecordingConsole::new();
+        let stage = Stage {
+            packages: Packages {
+                install: vec!["foo".into(), "bar".into()],
+                remove: vec!["baz".into()],
+                refresh: true,
+                upgrade: true,
+            },
+            ..Default::default()
+        };
+        run(&stage, &fs, &console).expect("ok");
+        assert_eq!(
+            console.commands(),
+            vec![
+                "dnf check-update".to_string(),
+                "dnf -y upgrade".to_string(),
+                "dnf -y install foo bar".to_string(),
+                "dnf -y remove baz".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn upgrade_after_failed_refresh_still_runs() {
+        // Per multierror semantics: a failing refresh accumulates an error
+        // but the rest of the chain proceeds (upgrade then install).
+        let fs = MemVfs::new();
+        write_os_release(&fs, "ID=ubuntu\n");
+        let console = RecordingConsole::new();
+        console.expect("apt-get update", Err("net down".to_string()));
+        let stage = Stage {
+            packages: Packages {
+                install: vec!["foo".into()],
+                refresh: true,
+                upgrade: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = run(&stage, &fs, &console).expect_err("refresh fails");
+        match err {
+            Error::Multi(errs) => assert_eq!(errs.len(), 1),
+            other => panic!("expected Multi, got {other:?}"),
+        }
+        // Subsequent stages still ran.
+        assert!(console
+            .commands()
+            .iter()
+            .any(|c| c == "apt-get -y upgrade"));
+        assert!(console
+            .commands()
+            .iter()
+            .any(|c| c == "apt-get -y install foo"));
+    }
 }
