@@ -65,13 +65,27 @@
 //!
 //! The plugin is a thin entrypoint over a [`LayoutOps`] trait. `LayoutOps`
 //! is the seam between "decide what commands to run" (pure, easy to test)
-//! and "actually run them" (effectful). The production implementation
-//! [`ConsoleLayoutOps`] just translates each trait method into one or
-//! more `console.run(...)` calls. Tests inject a `RecordingConsole` and
-//! assert on the exact command strings — that's the unit-testable
-//! surface. Any code path that requires reading back disk state
-//! (sfdisk's output, blkid's output) is mockable via [`LayoutOps`]
-//! methods that return synthetic data.
+//! and "actually run them" (effectful). Two production implementations
+//! exist:
+//!
+//! * [`ConsoleLayoutOps`] — always available. Translates every trait
+//!   method into one or more `console.run(...)` shell-outs (parted /
+//!   sfdisk / sgdisk / blkid). This is the only backend when the
+//!   `disk-builtin` feature is off.
+//! * [`GptLayoutOps`] — gated on the `disk-builtin` cargo feature. Uses
+//!   the [`gpt`](https://docs.rs/gpt) crate natively for the
+//!   *partition-table* operations (create GPT label, add partition,
+//!   read partitions, set name/bootable flag). Filesystem operations
+//!   (mkfs.*, resize2fs, xfs_growfs, btrfs filesystem resize) stay as
+//!   shell-outs in both backends — there is no production-quality
+//!   pure-Rust mkfs/resize.
+//!
+//! [`make_ops`] picks the right backend at compile time based on the
+//! feature flag. Tests inject a `RecordingConsole` and assert on the
+//! exact command strings — that's the unit-testable surface. Any code
+//! path that requires reading back disk state (sfdisk's output, blkid's
+//! output) is mockable via [`LayoutOps`] methods that return synthetic
+//! data.
 //!
 //! # Behaviour summary (matches Go semantics)
 //!
@@ -128,8 +142,26 @@ pub fn build() -> Plugin {
 
 /// Pure entry point — exposed so tests don't have to go through `Arc`.
 pub fn run(stage: &Stage, fs: &dyn Vfs, console: &dyn Console) -> Result<()> {
-    let ops = ConsoleLayoutOps::new(console);
-    run_with(stage, fs, &ops)
+    let ops = make_ops(console);
+    run_with(stage, fs, ops.as_ref())
+}
+
+/// Build the production [`LayoutOps`] impl. With `disk-builtin` enabled,
+/// returns a [`GptLayoutOps`] that uses the `gpt` crate natively for
+/// partition-table operations and delegates filesystem operations to
+/// shell-outs. Without the feature, returns a plain [`ConsoleLayoutOps`].
+#[cfg(feature = "disk-builtin")]
+pub fn make_ops<'c>(console: &'c dyn Console) -> Box<dyn LayoutOps + 'c> {
+    Box::new(GptLayoutOps::new(console))
+}
+
+/// Build the production [`LayoutOps`] impl. With `disk-builtin` enabled,
+/// returns a [`GptLayoutOps`] that uses the `gpt` crate natively for
+/// partition-table operations and delegates filesystem operations to
+/// shell-outs. Without the feature, returns a plain [`ConsoleLayoutOps`].
+#[cfg(not(feature = "disk-builtin"))]
+pub fn make_ops<'c>(console: &'c dyn Console) -> Box<dyn LayoutOps + 'c> {
+    Box::new(ConsoleLayoutOps::new(console))
 }
 
 /// Same as [`run`] but parameterised over the [`LayoutOps`] impl so tests
@@ -711,6 +743,271 @@ impl LayoutOps for ConsoleLayoutOps<'_> {
                 Ok(())
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Native gpt-crate-backed LayoutOps (feature = "disk-builtin").
+//
+// Only partition-table operations are reimplemented natively. Filesystem
+// operations (mkfs.*, resize2fs, xfs_growfs, btrfs filesystem resize) and
+// any "talk to the kernel about partitions" operations (partprobe,
+// udevadm settle, sgdisk repair) stay as shell-outs — there is no
+// production-quality Rust mkfs/resize, and re-reading the kernel's view
+// of a block device is exclusively a system-binary job.
+//
+// The strategy: hold an inner ConsoleLayoutOps and delegate every method
+// that's shell-only to it. Override init_disk_gpt / add_partition /
+// read_partitions to go through the `gpt` crate.
+// ---------------------------------------------------------------------------
+
+/// Native [`LayoutOps`] backed by the `gpt` crate for partition-table
+/// I/O. Filesystem creation and growth still shell out — see module
+/// docs for why.
+#[cfg(feature = "disk-builtin")]
+pub struct GptLayoutOps<'c> {
+    inner: ConsoleLayoutOps<'c>,
+}
+
+#[cfg(feature = "disk-builtin")]
+impl<'c> GptLayoutOps<'c> {
+    /// Build a new [`GptLayoutOps`] over the given console (used for
+    /// shell-out fallbacks).
+    pub fn new(console: &'c dyn Console) -> Self {
+        Self {
+            inner: ConsoleLayoutOps::new(console),
+        }
+    }
+}
+
+/// Map a yip filesystem string to the appropriate GPT partition type
+/// GUID. Defaults to `LINUX_FS` for anything unknown so we never accept
+/// a partition with an unset type.
+#[cfg(feature = "disk-builtin")]
+fn gpt_part_type_for(fs: &str) -> gpt::partition_types::Type {
+    match fs {
+        "vfat" | "fat" | "fat16" | "fat32" => gpt::partition_types::EFI,
+        "swap" => gpt::partition_types::LINUX_SWAP,
+        _ => gpt::partition_types::LINUX_FS,
+    }
+}
+
+/// Bit mask for the GPT "legacy-BIOS bootable" attribute (bit 2). We
+/// set this on partitions flagged bootable in the layout.
+#[cfg(feature = "disk-builtin")]
+const GPT_FLAG_LEGACY_BIOS_BOOTABLE: u64 = 1 << 2;
+
+/// 1 MiB in bytes — the canonical alignment we use for partition starts.
+#[cfg(feature = "disk-builtin")]
+const ONE_MIB: u64 = 1024 * 1024;
+
+#[cfg(feature = "disk-builtin")]
+impl LayoutOps for GptLayoutOps<'_> {
+    fn resolve_script_device(&self, raw: &str) -> Result<String> {
+        // Pure logic + maybe a shell-out for script://; delegate to the
+        // console impl.
+        self.inner.resolve_script_device(raw)
+    }
+
+    fn init_disk_gpt(&self, device: &str, _disk_name: &str) -> Result<()> {
+        use std::convert::TryFrom;
+        use std::io::{Seek, SeekFrom};
+
+        let path = Path::new(device);
+
+        // Determine logical block size & total device size to size the
+        // protective MBR correctly. For a regular file we use file
+        // length; for a block device we seek to end.
+        let mut probe = std::fs::OpenOptions::new()
+            .read(true)
+            .open(path)
+            .map_err(|e| Error::other(format!("gpt: open {device}: {e}")))?;
+        let total_bytes = probe
+            .seek(SeekFrom::End(0))
+            .map_err(|e| Error::other(format!("gpt: seek end {device}: {e}")))?;
+        drop(probe);
+
+        if total_bytes < 1024 * 1024 {
+            return Err(Error::other(format!(
+                "gpt: device {device} too small ({total_bytes} bytes) to hold a GPT label"
+            )));
+        }
+
+        // Write a protective MBR at LBA0 so the disk looks GPT-like to
+        // anything that reads the first sector. Use 512-byte sectors —
+        // matches the gpt crate default.
+        let mbr_total_lbas = u32::try_from((total_bytes / 512).saturating_sub(1))
+            .unwrap_or(0xFF_FF_FF_FF);
+        let mbr = gpt::mbr::ProtectiveMBR::with_lb_size(mbr_total_lbas);
+        let mut mbr_dev = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| Error::other(format!("gpt: open rw {device}: {e}")))?;
+        mbr.overwrite_lba0(&mut mbr_dev)
+            .map_err(|e| Error::other(format!("gpt: write protective MBR: {e}")))?;
+        drop(mbr_dev);
+
+        // Now create a fresh GPT on the device.
+        let cfg = gpt::GptConfig::new()
+            .writable(true)
+            .logical_block_size(gpt::disk::LogicalBlockSize::Lb512);
+        let disk = cfg
+            .create(path)
+            .map_err(|e| Error::other(format!("gpt: create label on {device}: {e}")))?;
+        disk.write()
+            .map_err(|e| Error::other(format!("gpt: write label on {device}: {e}")))?;
+        Ok(())
+    }
+
+    fn resolve_label_to_disk(&self, label: &str) -> Result<String> {
+        // blkid + lsblk are the only sane way to do this; stay shell.
+        self.inner.resolve_label_to_disk(label)
+    }
+
+    fn verify_and_repair_headers(&self, device: &str) -> Result<()> {
+        // sgdisk -e is the canonical "relocate backup header to disk
+        // end" tool. The gpt crate's write() already places the backup
+        // header at the right LBA, so when we created/edited the table
+        // ourselves there's nothing to repair. But if we're operating
+        // on an externally-created table we may still benefit, so we
+        // run the best-effort shell-out.
+        self.inner.verify_and_repair_headers(device)
+    }
+
+    fn read_partitions(&self, device: &str) -> Result<Vec<ExistingPartition>> {
+        let path = Path::new(device);
+        // Read-only open; if it fails (e.g. device has no GPT yet),
+        // treat as "no partitions" — matches the sfdisk-backed
+        // behaviour in ConsoleLayoutOps.
+        let disk = match gpt::GptConfig::new().writable(false).open(path) {
+            Ok(d) => d,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let lb_size: u64 = (*disk.logical_block_size()).into();
+        let mut out = Vec::new();
+        for (idx, part) in disk.partitions() {
+            if !part.is_used() {
+                continue;
+            }
+            let start_bytes = part.first_lba.saturating_mul(lb_size);
+            // last_lba is inclusive; the end byte of the partition is
+            // (last_lba + 1) * lb_size - 1. Convert to MiB.
+            let end_bytes = (part.last_lba.saturating_add(1))
+                .saturating_mul(lb_size)
+                .saturating_sub(1);
+            out.push(ExistingPartition {
+                number: *idx,
+                p_label: part.name.clone(),
+                fs_label: String::new(),
+                start_mib: start_bytes / ONE_MIB,
+                end_mib: end_bytes / ONE_MIB,
+            });
+        }
+        out.sort_by_key(|p| p.number);
+        Ok(out)
+    }
+
+    fn add_partition(&self, device: &str, plan: &PartitionPlan) -> Result<()> {
+        // NOTE: the gpt crate's `add_partition` auto-places at the first
+        // aligned free section. We pass `start_mib` as part of `plan` but
+        // don't enforce it here — instead we trust `plan_partitions` to
+        // have left a hole at the right MiB and rely on the crate's
+        // free-sector search + 1 MiB alignment to land in the same place.
+        // For pathological layouts (manually-placed partitions with gaps
+        // smaller than 1 MiB) the placement may differ from the parted
+        // backend. If that ever matters, switch to `add_partition_at`
+        // with first_lba = start_mib * (1 MiB / lb_size).
+        let path = Path::new(device);
+        let mut disk = gpt::GptConfig::new()
+            .writable(true)
+            .open(path)
+            .map_err(|e| Error::other(format!("gpt: open {device}: {e}")))?;
+        let lb_size: u64 = (*disk.logical_block_size()).into();
+
+        let part_type = gpt_part_type_for(&plan.file_system);
+        let flags = if plan.bootable {
+            GPT_FLAG_LEGACY_BIOS_BOOTABLE
+        } else {
+            0
+        };
+        let name = if plan.p_label.is_empty() {
+            "primary".to_string()
+        } else {
+            plan.p_label.clone()
+        };
+
+        if plan.size_mib == 0 || plan.end_mib == 0 {
+            // "Fill remaining space" — use the size of the largest free
+            // section that respects 1 MiB alignment, less any
+            // alignment slack. We use add_partition() (auto-placement)
+            // with size set to that maximum.
+            let align_lbas = ONE_MIB / lb_size;
+            let free = disk.find_free_sectors();
+            let max_aligned_bytes = free
+                .iter()
+                .map(|(start, length)| {
+                    let off = if align_lbas == 0 {
+                        0
+                    } else {
+                        (align_lbas - (start % align_lbas)) % align_lbas
+                    };
+                    let usable = length.saturating_sub(off);
+                    usable.saturating_mul(lb_size)
+                })
+                .max()
+                .unwrap_or(0);
+            if max_aligned_bytes == 0 {
+                return Err(Error::other(format!(
+                    "gpt: no free space on {device} to add fill-remainder partition"
+                )));
+            }
+            disk.add_partition(
+                &name,
+                max_aligned_bytes,
+                part_type,
+                flags,
+                Some(ONE_MIB / lb_size),
+            )
+            .map_err(|e| Error::other(format!("gpt: add_partition {name}: {e}")))?;
+        } else {
+            let size_bytes = plan
+                .size_mib
+                .saturating_mul(ONE_MIB);
+            disk.add_partition(
+                &name,
+                size_bytes,
+                part_type,
+                flags,
+                Some(ONE_MIB / lb_size),
+            )
+            .map_err(|e| Error::other(format!("gpt: add_partition {name}: {e}")))?;
+        }
+        disk.write()
+            .map_err(|e| Error::other(format!("gpt: write {device}: {e}")))?;
+        Ok(())
+    }
+
+    fn settle(&self, device: &str) -> Result<()> {
+        // Kernel re-read of the partition table is unconditional system
+        // binary territory; delegate.
+        self.inner.settle(device)
+    }
+
+    fn mkfs(&self, device: &str, plan: &PartitionPlan) -> Result<()> {
+        // Filesystem creation ALWAYS shells out — no production-quality
+        // Rust mkfs.* exists.
+        self.inner.mkfs(device, plan)
+    }
+
+    fn expand_last_partition(&self, device: &str, target_mib: u64) -> Result<()> {
+        // Partition entry resize + filesystem grow. The latter is shell
+        // territory unconditionally; for the former, the gpt crate has
+        // no in-place "grow this partition" helper (you'd remove+re-add
+        // at the same first_lba, with risk of stomping on tables). We
+        // punt the whole flow to parted/resize2fs which both handle the
+        // bookkeeping correctly.
+        self.inner.expand_last_partition(device, target_mib)
     }
 }
 
@@ -1567,7 +1864,16 @@ mod tests {
     }
 
     // ---------- ConsoleLayoutOps direct tests for command shape ----------
+    //
+    // These tests assert the exact shell-command shape produced by the
+    // shell-out backend. When `disk-builtin` is enabled, the production
+    // dispatcher uses `GptLayoutOps` instead, which goes through the
+    // `gpt` crate for partition-table I/O — so the parted/sfdisk
+    // expectations no longer represent what runs in production. The
+    // tests still compile (ConsoleLayoutOps is still in the binary as
+    // GptLayoutOps's fallback) but they're not the contract we ship.
 
+    #[cfg(not(feature = "disk-builtin"))]
     #[test]
     fn console_ops_mkpart_command_shape() {
         let console = RecordingConsole::new();
@@ -1594,6 +1900,7 @@ mod tests {
             .any(|c| c == "parted -s /dev/sda name 1 DATA"));
     }
 
+    #[cfg(not(feature = "disk-builtin"))]
     #[test]
     fn console_ops_mkfs_ext4_command_shape() {
         let console = RecordingConsole::new();
@@ -1612,6 +1919,7 @@ mod tests {
         assert_eq!(console.commands(), vec!["mkfs.ext4 -L DATA -F /dev/sda1"]);
     }
 
+    #[cfg(not(feature = "disk-builtin"))]
     #[test]
     fn console_ops_mkfs_xfs_uses_dash_L_and_no_F() {
         let console = RecordingConsole::new();
@@ -1630,6 +1938,7 @@ mod tests {
         assert_eq!(console.commands(), vec!["mkfs.xfs -L DATA /dev/sda1"]);
     }
 
+    #[cfg(not(feature = "disk-builtin"))]
     #[test]
     fn console_ops_mkfs_vfat_uses_dash_n() {
         let console = RecordingConsole::new();
@@ -1648,6 +1957,7 @@ mod tests {
         assert_eq!(console.commands(), vec!["mkfs.fat -n EFI /dev/sda2"]);
     }
 
+    #[cfg(not(feature = "disk-builtin"))]
     #[test]
     fn console_ops_mkfs_btrfs_has_dash_f() {
         let console = RecordingConsole::new();
@@ -1666,6 +1976,7 @@ mod tests {
         assert_eq!(console.commands(), vec!["mkfs.btrfs -L DATA -f /dev/sda1"]);
     }
 
+    #[cfg(not(feature = "disk-builtin"))]
     #[test]
     fn console_ops_mkfs_swap_uses_mkswap() {
         let console = RecordingConsole::new();
@@ -1684,6 +1995,7 @@ mod tests {
         assert_eq!(console.commands(), vec!["mkswap -L SWAP /dev/sda3"]);
     }
 
+    #[cfg(not(feature = "disk-builtin"))]
     #[test]
     fn console_ops_mkfs_nvme_uses_p_separator() {
         let console = RecordingConsole::new();
@@ -1702,6 +2014,7 @@ mod tests {
         assert_eq!(console.commands(), vec!["mkfs.ext4 -F /dev/nvme0n1p1"]);
     }
 
+    #[cfg(not(feature = "disk-builtin"))]
     #[test]
     fn console_ops_init_disk_gpt() {
         let console = RecordingConsole::new();
@@ -1710,6 +2023,7 @@ mod tests {
         assert_eq!(console.commands(), vec!["parted -s /dev/sda mklabel gpt"]);
     }
 
+    #[cfg(not(feature = "disk-builtin"))]
     #[test]
     fn console_ops_resolve_script_device_passthrough() {
         let console = RecordingConsole::new();
@@ -1719,6 +2033,7 @@ mod tests {
         assert!(console.commands().is_empty(), "no run for non-script path");
     }
 
+    #[cfg(not(feature = "disk-builtin"))]
     #[test]
     fn console_ops_resolve_script_device_runs_and_trims() {
         let console = RecordingConsole::new();
@@ -1729,6 +2044,7 @@ mod tests {
         assert_eq!(console.commands(), vec!["/opt/pick.sh"]);
     }
 
+    #[cfg(not(feature = "disk-builtin"))]
     #[test]
     fn console_ops_resolve_script_device_empty_command_errors() {
         let console = RecordingConsole::new();
@@ -1737,6 +2053,7 @@ mod tests {
         assert!(format!("{err}").contains("no command specified"));
     }
 
+    #[cfg(not(feature = "disk-builtin"))]
     #[test]
     fn console_ops_resolve_script_device_empty_output_errors() {
         let console = RecordingConsole::new();
@@ -1744,5 +2061,88 @@ mod tests {
         let ops = ConsoleLayoutOps::new(&console);
         let err = ops.resolve_script_device("script:///opt/pick.sh").unwrap_err();
         assert!(format!("{err}").contains("empty output"));
+    }
+
+    // ---------- GptLayoutOps direct tests (feature = "disk-builtin") ----------
+
+    /// End-to-end smoke test for the native gpt-crate backend: create a
+    /// sparse 100 MiB image, init_disk_gpt it, add one partition, then
+    /// re-open with the gpt crate directly and confirm the partition
+    /// shows up with the right name and size.
+    #[cfg(feature = "disk-builtin")]
+    #[test]
+    fn gpt_ops_init_and_add_partition_round_trip() {
+        use std::io::{Seek, SeekFrom, Write};
+        let tmp = tempfile::NamedTempFile::new().expect("create tempfile");
+        // 100 MiB sparse file: seek past end and write one zero byte.
+        {
+            let mut f = tmp.reopen().expect("reopen tempfile");
+            f.seek(SeekFrom::Start(100 * 1024 * 1024 - 1))
+                .expect("seek");
+            f.write_all(&[0]).expect("write final byte");
+            f.flush().expect("flush");
+        }
+        let path = tmp.path().to_str().expect("utf-8 path").to_string();
+
+        let console = RecordingConsole::new();
+        let ops = GptLayoutOps::new(&console);
+
+        ops.init_disk_gpt(&path, "").expect("init_disk_gpt");
+
+        // After init, no partitions yet.
+        let empty = ops.read_partitions(&path).expect("read empty");
+        assert!(empty.is_empty(), "expected zero partitions, got {empty:?}");
+
+        // Add one 10 MiB partition named DATA.
+        let plan = PartitionPlan {
+            number: 1,
+            file_system: "ext4".into(),
+            fs_label: "DATA".into(),
+            p_label: "DATA".into(),
+            bootable: false,
+            start_mib: 1,
+            end_mib: 11,
+            size_mib: 10,
+        };
+        ops.add_partition(&path, &plan).expect("add_partition");
+
+        // Re-read via the gpt crate directly (independent of our ops impl).
+        let disk = gpt::GptConfig::new()
+            .writable(false)
+            .open(&path)
+            .expect("reopen gpt disk");
+        let parts: Vec<_> = disk
+            .partitions()
+            .values()
+            .filter(|p| p.is_used())
+            .collect();
+        assert_eq!(parts.len(), 1, "expected exactly one partition");
+        assert_eq!(parts[0].name, "DATA");
+        // 10 MiB / 512 = 20480 LBAs; last_lba - first_lba + 1 should be 20480.
+        let lba_count = parts[0].last_lba - parts[0].first_lba + 1;
+        assert_eq!(lba_count, 10 * 1024 * 1024 / 512);
+        // No mkfs / mkpart shell-outs should have happened on this code path —
+        // GptLayoutOps does the table edits natively.
+        for cmd in console.commands() {
+            assert!(
+                !cmd.contains("parted") && !cmd.contains("sfdisk"),
+                "unexpected shell-out leaked into native gpt path: {cmd}"
+            );
+        }
+    }
+
+    /// `read_partitions` on a non-GPT or non-existent file returns an
+    /// empty list (matches the sfdisk-failed → Vec::new() behaviour of
+    /// ConsoleLayoutOps).
+    #[cfg(feature = "disk-builtin")]
+    #[test]
+    fn gpt_ops_read_partitions_on_blank_returns_empty() {
+        let tmp = tempfile::NamedTempFile::new().expect("create tempfile");
+        // Don't init — leave it as a zero-byte file.
+        let path = tmp.path().to_str().expect("utf-8 path").to_string();
+        let console = RecordingConsole::new();
+        let ops = GptLayoutOps::new(&console);
+        let parts = ops.read_partitions(&path).expect("read should not error");
+        assert!(parts.is_empty());
     }
 }

@@ -60,19 +60,30 @@ jaq-syn = "1"
 # Git: gix is feature-gated so we can also shell out if size matters.
 gix = { version = "0.66", default-features = false, features = ["blocking-network-client", "blocking-http-transport-reqwest"], optional = true }
 
-# OCI image pull/unpack
+# OCI image pull/unpack. tokio is only pulled in for the blocking runtime
+# adapter we drive oci-distribution's async API with.
 oci-distribution = { version = "0.11", default-features = false, features = ["rustls-tls"], optional = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"], optional = true }
 tar = "0.4"
 flate2 = "1"
+
+# Disk partitioning. Native impls; mkfs still shells out (no production-quality
+# Rust mkfs.ext4 yet).
+gpt = { version = "4", optional = true }
+mbrman = { version = "0.6", optional = true }
 
 # Password hashing for `users` plugin (yescrypt/sha512crypt as Linux uses)
 sha-crypt = "0.5"
 
 [features]
-default = ["git-builtin", "oci-builtin"]
+# Default brings every native backend in. Disable the relevant flag to shrink
+# the binary at the cost of needing the matching system binary (git / skopeo /
+# parted / sgdisk).
+default = ["git-builtin", "oci-builtin", "disk-builtin"]
 git-builtin = ["dep:gix"]
-oci-builtin = ["dep:oci-distribution"]
-# Disable both to get a smaller binary that shells out to `git` / `skopeo` instead.
+oci-builtin = ["dep:oci-distribution", "dep:tokio"]
+disk-builtin = ["dep:gpt", "dep:mbrman"]
+# Hard-disable a whole plugin (overrides the *-builtin flags).
 nogit = []
 nounpack = []
 
