@@ -1,1 +1,357 @@
-//! Stub — wave-3/4/5 fills this in.
+//! `download` plugin — fetch each entry in `stage.downloads` over HTTP and
+//! materialise it under [`Download::path`].
+//!
+//! Port of `pkg/plugins/download.go::Download`. For each [`Download`]:
+//!   1. Ensure the parent directory of `download.path` exists.
+//!   2. HTTP `GET` `download.url` using a `reqwest::blocking` client with
+//!      `timeout = download.timeout` (seconds; 0 → default 30s).
+//!   3. Read the entire body into memory and write it to `download.path`
+//!      via [`Vfs::write`]. We don't stream chunks to disk because the
+//!      [`Vfs`] trait deliberately exposes only `write(&[u8])` — keeping it
+//!      tiny is more useful than supporting GB-sized downloads, which yip
+//!      doesn't do in practice.
+//!   4. Apply `chmod` if `permissions != 0`.
+//!   5. Apply `chown` for numeric owner/group; name-based owners are
+//!      skipped with a warning (mirrors [`crate::plugins::files`]).
+//!
+//! All per-download errors are aggregated into [`Error::Multi`]; the loop
+//! never aborts early, matching Go's `multierror.Append`.
+//!
+//! Differences from Go:
+//!   - Go uses `cavaliergopher/grab` to write the body to disk directly
+//!     (with progress ticks). We don't — see point 3 above. The progress
+//!     log is therefore omitted; a single `debug!` is emitted per download.
+//!   - Go falls back to `OwnerString` parsing via `/etc/passwd`. We log a
+//!     warning and skip (same behaviour as the `files` plugin).
+
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tracing::{debug, info, warn};
+
+use crate::console::Console;
+use crate::error::{Error, Result};
+use crate::executor::Plugin;
+use crate::schema::file::{Download, OwnerId};
+use crate::schema::Stage;
+use crate::vfs::Vfs;
+
+/// Default HTTP timeout when `Download::timeout` is 0 (seconds). Matches
+/// `grab`'s implicit "no timeout means use whatever the http.Client gives
+/// you" — we pick something finite so a hanging server can't wedge a stage.
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+/// Build a [`Plugin`] arc-closure.
+pub fn build() -> Plugin {
+    Arc::new(run)
+}
+
+/// Pure entry point — exposed so tests don't have to go through `Arc`.
+pub fn run(stage: &Stage, fs: &dyn Vfs, _console: &dyn Console) -> Result<()> {
+    if stage.downloads.is_empty() {
+        return Ok(());
+    }
+
+    info!(count = stage.downloads.len(), "downloading stage files");
+
+    let mut errs: Vec<Error> = Vec::new();
+    for dl in &stage.downloads {
+        if let Err(e) = download_one(dl, fs) {
+            warn!(path = %dl.path, url = %dl.url, error = %e, "download failed");
+            errs.push(e);
+        }
+    }
+
+    match errs.len() {
+        0 => Ok(()),
+        _ => Err(Error::Multi(errs)),
+    }
+}
+
+fn download_one(dl: &Download, fs: &dyn Vfs) -> Result<()> {
+    if dl.path.is_empty() {
+        return Err(Error::other("download entry has empty path"));
+    }
+    if dl.url.is_empty() {
+        return Err(Error::other(format!(
+            "download entry for {} has empty url",
+            dl.path
+        )));
+    }
+
+    let path = Path::new(&dl.path);
+
+    // 1. mkdir parent.
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            debug!(parent = %parent.display(), "ensuring parent dir");
+            fs.mkdir_all(parent)?;
+        }
+    }
+
+    // 2. HTTP GET with timeout.
+    let timeout_secs = if dl.timeout > 0 {
+        dl.timeout as u64
+    } else {
+        DEFAULT_TIMEOUT_SECS
+    };
+    debug!(url = %dl.url, path = %dl.path, timeout = timeout_secs, "downloading");
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .user_agent("yip")
+        .build()
+        .map_err(|e| Error::other(format!("build http client: {e}")))?;
+
+    let resp = client
+        .get(&dl.url)
+        .send()
+        .map_err(|e| Error::other(format!("http get {}: {e}", dl.url)))?;
+
+    if !resp.status().is_success() {
+        return Err(Error::other(format!(
+            "http get {}: status {}",
+            dl.url,
+            resp.status()
+        )));
+    }
+
+    let bytes = resp
+        .bytes()
+        .map_err(|e| Error::other(format!("http body {}: {e}", dl.url)))?;
+
+    // 3. Write to disk via Vfs.
+    debug!(path = %dl.path, size = bytes.len(), "writing downloaded file");
+    fs.write(path, &bytes)?;
+
+    // 4. chmod.
+    if dl.permissions != 0 {
+        debug!(path = %dl.path, mode = format!("{:o}", dl.permissions), "chmod");
+        fs.chmod(path, dl.permissions)?;
+    }
+
+    // 5. chown.
+    apply_chown(path, dl, fs)?;
+
+    Ok(())
+}
+
+/// Apply ownership. Mirrors the `files` plugin: numeric owners pass
+/// through, name-based owners log a warn and skip.
+fn apply_chown(path: &Path, dl: &Download, fs: &dyn Vfs) -> Result<()> {
+    if !dl.owner_string.is_empty() {
+        warn!(
+            path = %path.display(),
+            owner_string = %dl.owner_string,
+            "name-based owner_string not supported yet; skipping chown",
+        );
+        return Ok(());
+    }
+    if let Some(name) = dl.owner.as_name() {
+        warn!(
+            path = %path.display(),
+            owner = %name,
+            "name-based owner not supported yet; skipping chown",
+        );
+        return Ok(());
+    }
+
+    let uid = dl.owner.as_int();
+    if uid == 0 && dl.group == 0 {
+        return Ok(());
+    }
+
+    debug!(path = %path.display(), uid, gid = dl.group, "chown");
+    fs.chown(path, uid, dl.group)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::console::RecordingConsole;
+    use crate::vfs::MemVfs;
+
+    #[test]
+    fn empty_downloads_is_ok() {
+        let stage = Stage::default();
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        run(&stage, &fs, &console).expect("empty downloads -> Ok");
+    }
+
+    #[test]
+    fn downloads_body_to_path() {
+        let mut server = mockito::Server::new();
+        let m = server
+            .mock("GET", "/file")
+            .with_status(200)
+            .with_body("hello")
+            .create();
+
+        let url = format!("{}/file", server.url());
+        let stage = Stage {
+            downloads: vec![Download {
+                path: "/tmp/test/foo".to_string(),
+                url,
+                permissions: 0o644,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        run(&stage, &fs, &console).expect("download should succeed");
+        m.assert();
+
+        let got = fs
+            .read(Path::new("/tmp/test/foo"))
+            .expect("read written file");
+        assert_eq!(got, b"hello");
+
+        let meta = fs.metadata(Path::new("/tmp/test/foo")).expect("metadata");
+        assert!(meta.is_file);
+        assert_eq!(meta.mode, 0o644);
+    }
+
+    #[test]
+    fn http_404_is_aggregated_error_other_downloads_proceed() {
+        let mut server = mockito::Server::new();
+        let ok_mock = server
+            .mock("GET", "/good")
+            .with_status(200)
+            .with_body("OK-BODY")
+            .create();
+        let bad_mock = server.mock("GET", "/bad").with_status(404).create();
+        let also_ok_mock = server
+            .mock("GET", "/also-good")
+            .with_status(200)
+            .with_body("ALSO")
+            .create();
+
+        let stage = Stage {
+            downloads: vec![
+                Download {
+                    path: "/d/good".to_string(),
+                    url: format!("{}/good", server.url()),
+                    ..Default::default()
+                },
+                Download {
+                    path: "/d/bad".to_string(),
+                    url: format!("{}/bad", server.url()),
+                    ..Default::default()
+                },
+                Download {
+                    path: "/d/also-good".to_string(),
+                    url: format!("{}/also-good", server.url()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        let err = run(&stage, &fs, &console).expect_err("should aggregate one error");
+        match err {
+            Error::Multi(errs) => assert_eq!(errs.len(), 1, "exactly one failed download"),
+            other => panic!("expected Error::Multi, got {other:?}"),
+        }
+
+        // The two good downloads landed; the failing one did not.
+        ok_mock.assert();
+        bad_mock.assert();
+        also_ok_mock.assert();
+
+        assert_eq!(fs.read(Path::new("/d/good")).unwrap(), b"OK-BODY");
+        assert_eq!(fs.read(Path::new("/d/also-good")).unwrap(), b"ALSO");
+        assert!(!fs.exists(Path::new("/d/bad")));
+    }
+
+    #[test]
+    fn timeout_short_circuits_slow_server() {
+        let mut server = mockito::Server::new();
+        let m = server
+            .mock("GET", "/slow")
+            .with_status(200)
+            .with_body("eventually")
+            .with_chunked_body(|_| {
+                // Sleep longer than the per-download timeout below.
+                std::thread::sleep(Duration::from_secs(5));
+                Ok(())
+            })
+            .expect_at_most(1)
+            .create();
+
+        let stage = Stage {
+            downloads: vec![Download {
+                path: "/slow".to_string(),
+                url: format!("{}/slow", server.url()),
+                timeout: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        let err = run(&stage, &fs, &console).expect_err("timeout should error");
+        match err {
+            Error::Multi(errs) => assert_eq!(errs.len(), 1),
+            other => panic!("expected Error::Multi, got {other:?}"),
+        }
+        // The slow path was not written.
+        assert!(!fs.exists(Path::new("/slow")));
+        // Don't strictly assert mockito's hit count — the timeout may abort
+        // before or after the handler completes — but the matcher is set up
+        // so it's allowed to be hit at most once.
+        drop(m);
+    }
+
+    #[test]
+    fn empty_path_is_error() {
+        let stage = Stage {
+            downloads: vec![Download {
+                path: "".to_string(),
+                url: "http://example.invalid/x".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        let err = run(&stage, &fs, &console).expect_err("empty path -> err");
+        match err {
+            Error::Multi(errs) => assert_eq!(errs.len(), 1),
+            other => panic!("expected Error::Multi, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn numeric_owner_is_applied() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/owned")
+            .with_status(200)
+            .with_body("x")
+            .create();
+
+        let stage = Stage {
+            downloads: vec![Download {
+                path: "/owned".to_string(),
+                url: format!("{}/owned", server.url()),
+                owner: OwnerId::Numeric(1000),
+                group: 1000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::new();
+        run(&stage, &fs, &console).expect("should succeed");
+
+        let m = fs.metadata(Path::new("/owned")).expect("metadata");
+        assert_eq!((m.uid, m.gid), (1000, 1000));
+    }
+}
