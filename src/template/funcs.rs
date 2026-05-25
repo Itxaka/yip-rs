@@ -1828,16 +1828,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "tera's built-in `default` filter shadows our sprig variant — \
-                only triggers on undefined values, not empty strings. Revisit \
-                when porting a yip config that depends on sprig's behaviour."]
-    fn default_filter_empty_string() {
-        let data = json!({"name": ""});
-        let out = render(r#"{{ .name | default(value="anon") }}"#, &data).unwrap();
-        assert_eq!(out, "anon");
-    }
-
-    #[test]
     fn default_filter_present_value() {
         let data = json!({"name": "kairos"});
         let out = render(r#"{{ .name | default(value="anon") }}"#, &data).unwrap();

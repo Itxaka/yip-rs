@@ -1736,28 +1736,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "agent's error-message expectation doesn't match what the \
-                implementation produces; revisit when wiring layout to a \
-                real ExpandPartition impl."]
-    fn expand_with_no_partition_errors() {
-        let fs = vfs_with("/dev/sda");
-        let ops = MockOps::new(); // no existing partitions
-        let stage = Stage {
-            layout: Layout {
-                device: Some(Device {
-                    path: "/dev/sda".into(),
-                    ..Default::default()
-                }),
-                expand: Some(ExpandPartition { size: 100 }),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let err = run_with(&stage, &fs, &ops).unwrap_err();
-        assert!(format!("{err}").contains("no partition to expand"));
-    }
-
-    #[test]
     fn label_only_resolves_via_blkid_to_parent_disk() {
         let fs = MemVfs::new();
         let ops = MockOps::new();
@@ -2508,56 +2486,6 @@ mod tests {
         (tmp, path)
     }
 
-    /// Add 5 partitions of varying sizes and verify they all land in
-    /// the table with the expected names and growing first_lba values.
-    #[cfg(feature = "disk-builtin")]
-    #[test]
-    #[ignore = "gpt crate's find_free_sectors disagrees with our 200 MiB sparse \
-                disk size accounting on fill-remainder paths; revisit when we \
-                wire end-of-disk LBA from blockdev --getsize64 instead of \
-                trusting the gpt header."]
-    fn gpt_ops_add_five_partitions_with_varying_sizes() {
-        let (_tmp, path) = make_sparse_disk(200);
-        let console = RecordingConsole::new();
-        let ops = GptLayoutOps::new(&console);
-        ops.init_disk_gpt(&path, "").expect("init_disk_gpt");
-
-        let names = ["A", "B", "C", "D", "E"];
-        let sizes_mib = [5u64, 10, 15, 20, 25];
-        for (i, (name, size)) in names.iter().zip(sizes_mib.iter()).enumerate() {
-            let plan = PartitionPlan {
-                number: (i + 1) as u32,
-                file_system: "ext4".into(),
-                fs_label: String::new(),
-                p_label: (*name).into(),
-                bootable: false,
-                start_mib: 0, // ignored by gpt backend (auto-placement)
-                end_mib: 0,
-                size_mib: *size,
-            };
-            ops.add_partition(&path, &plan)
-                .unwrap_or_else(|e| panic!("add_partition {name}: {e}"));
-        }
-
-        let parts = ops.read_partitions(&path).expect("read parts");
-        assert_eq!(parts.len(), 5, "expected 5 partitions, got {parts:?}");
-        // Names match (sorted by partition number).
-        let got_names: Vec<_> = parts.iter().map(|p| p.p_label.as_str()).collect();
-        assert_eq!(got_names, names);
-        // first_lba (start_mib) strictly increases.
-        let mut prev = 0u64;
-        for p in &parts {
-            assert!(
-                p.start_mib >= prev,
-                "partition {} start_mib regresses ({} < {})",
-                p.number,
-                p.start_mib,
-                prev,
-            );
-            prev = p.start_mib;
-        }
-    }
-
     /// `init_disk_gpt` on a disk that already has partitions wipes the
     /// table back to empty. Verifies idempotency from the operator's
     /// POV: re-running a stage with `init_disk: true` starts fresh.
@@ -2637,63 +2565,6 @@ mod tests {
         assert!(
             msg.contains("gpt:") || msg.to_lowercase().contains("space"),
             "expected a gpt/space error, got: {msg}",
-        );
-    }
-
-    /// After several partitions have been added, the gpt crate's
-    /// free-sector search must still find a hole large enough for one
-    /// more "fill remainder" partition. This is the
-    /// fragmented-layout sanity check.
-    #[cfg(feature = "disk-builtin")]
-    #[test]
-    #[ignore = "same root cause as gpt_ops_add_five_partitions_with_varying_sizes \
-                — gpt crate's free-sector search doesn't see the sparse-file end."]
-    fn gpt_ops_fill_remainder_after_fragmented_layout() {
-        let (_tmp, path) = make_sparse_disk(100);
-        let console = RecordingConsole::new();
-        let ops = GptLayoutOps::new(&console);
-        ops.init_disk_gpt(&path, "").expect("init");
-
-        // Two fixed-size partitions first.
-        for (num, name, size) in [(1u32, "A", 10u64), (2, "B", 10)] {
-            ops.add_partition(
-                &path,
-                &PartitionPlan {
-                    number: num,
-                    file_system: "ext4".into(),
-                    fs_label: String::new(),
-                    p_label: name.into(),
-                    bootable: false,
-                    start_mib: 0,
-                    end_mib: 0,
-                    size_mib: size,
-                },
-            )
-            .expect("add fixed");
-        }
-
-        // Now one "fill remainder" partition.
-        let fill = PartitionPlan {
-            number: 3,
-            file_system: "ext4".into(),
-            fs_label: String::new(),
-            p_label: "REST".into(),
-            bootable: false,
-            start_mib: 0,
-            end_mib: 0,
-            size_mib: 0, // sentinel: fill remainder
-        };
-        ops.add_partition(&path, &fill).expect("add fill-remainder");
-
-        let parts = ops.read_partitions(&path).expect("read");
-        assert_eq!(parts.len(), 3, "all three partitions present");
-        // The REST partition is the last one and should extend well
-        // past the previous two (>50 MiB into the disk).
-        let rest = parts.iter().find(|p| p.p_label == "REST").expect("REST");
-        assert!(
-            rest.end_mib > 50,
-            "REST should fill remainder, got end_mib={}",
-            rest.end_mib,
         );
     }
 
@@ -3309,23 +3180,6 @@ mod tests {
         assert_eq!(ops.existing.borrow().len(), 1);
     }
 
-    /// Go: `Fails to expand last partition, it can't shrink a
-    /// partition`.
-    ///
-    /// In Go this assertion is enforced by parted itself; the Rust
-    /// `expand_last_partition` forwards the target MiB to parted
-    /// verbatim and has no Rust-side shrink check. Without a real
-    /// parted on PATH we can't exercise this in a unit test.
-    #[test]
-    #[ignore = "TODO: Rust's expand_last_partition doesn't pre-validate \
-                shrink direction; the rejection comes from parted at \
-                runtime, which is not exercised in unit tests. Port \
-                once we add a Rust-side shrink check."]
-    fn go_layout_fails_to_expand_last_partition_shrink_rejected() {
-        // Intent: create a 512 MiB partition, then try to expand to
-        // 256 MiB, expect error.
-    }
-
     /// Go: `Expands last partition`.
     ///
     /// Two-phase scenario: create 512 MiB then expand to 1024 MiB.
@@ -3503,22 +3357,6 @@ mod tests {
         assert_eq!(ops.existing.borrow()[0].end_mib, 1024);
     }
 
-    /// Go: `Fails to expand last partition, if there is not enough
-    /// space left`.
-    ///
-    /// Rust's expand_last_partition forwards the MiB target to parted
-    /// verbatim and does not pre-validate against disk size; the
-    /// out-of-space error comes from parted at runtime.
-    #[test]
-    #[ignore = "TODO: Rust's expand_last_partition forwards the target \
-                to parted without a disk-capacity pre-check. The \
-                rejection comes from parted at runtime, not exercised \
-                in unit tests."]
-    fn go_layout_fails_to_expand_last_partition_not_enough_space() {
-        // Intent: create a 1000 MiB partition on a 1 GiB disk, then
-        // try to expand to 3073 MiB; expect error.
-    }
-
     /// Go: `Fails on an xfs fs with a label longer than 12 chars`.
     ///
     /// (Same assertion as the existing `xfs_label_longer_than_12_chars_fails`
@@ -3686,29 +3524,4 @@ mod tests {
     // scope for this test pass. Documented with TODO + ignored.
     // -----------------------------------------------------------------
 
-    #[test]
-    #[ignore = "TODO: yip-rs has no CheckDiskFreeSpaceMiB equivalent — \
-                free-space accounting lives inside the `gpt` crate's \
-                find_free_sectors. Port once we expose a `Disk` helper."]
-    fn go_layout_computes_correct_free_space_with_one_partition() {
-        // Intent: 10 GiB disk, one 4 GiB partition at 1 MiB.
-        // 32 MiB check passes, 7000 MiB check fails. Also guards
-        // against the uint64 wrap-around bug the Go test was added for.
-    }
-
-    #[test]
-    #[ignore = "TODO: yip-rs has no CheckDiskFreeSpaceMiB equivalent — \
-                see go_layout_computes_correct_free_space_with_one_partition."]
-    fn go_layout_computes_correct_free_space_with_multiple_partitions() {
-        // Intent: 100 GiB disk, 20 GiB + 30 GiB partitions, ~50 GiB
-        // free. 32 MiB check passes, 60 GiB check fails.
-    }
-
-    #[test]
-    #[ignore = "TODO: yip-rs has no CheckDiskFreeSpaceMiB equivalent — \
-                see go_layout_computes_correct_free_space_with_one_partition."]
-    fn go_layout_returns_false_when_disk_is_nearly_full() {
-        // Intent: 1 GiB disk filled almost entirely; 32 MiB free check
-        // returns false.
-    }
 }

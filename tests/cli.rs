@@ -138,11 +138,3 @@ fn analyze_subcommand_lists_ops() {
                 .or(predicate::str::contains("test")),
         );
 }
-
-#[test]
-#[ignore = "requires network access"]
-fn apply_remote_config_over_http() {
-    // Placeholder for a future test that pulls a config over HTTP. Marked
-    // ignored so the default `cargo test` invocation stays hermetic.
-    let _ = Command::cargo_bin("yip").expect("yip binary");
-}

@@ -722,30 +722,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "tar crate's set_path rejects `..` upfront, so we can't \
-                construct a malicious tar to feed extract_layer. \
-                sanitize_rel still rejects `..` at extract time — \
-                covered via direct unit test below."]
-    fn rejects_path_traversal() {
-        use crate::vfs::MemVfs;
-        let blob = build_tar_gz(&[("../escape", 0o644, b"nope")]);
-        let fs = MemVfs::new();
-        let target = Path::new("/safe");
-        fs.mkdir_all(target).unwrap();
-        let err = extract_layer(
-            &blob,
-            "application/vnd.oci.image.layer.v1.tar+gzip",
-            target,
-            &fs,
-        )
-        .expect_err("must reject ..");
-        match err {
-            Error::Other(msg) => assert!(msg.contains(".."), "msg: {msg}"),
-            other => panic!("expected Other, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn sanitize_rel_rejects_dotdot() {
         let err = sanitize_rel(Path::new("a/../b")).expect_err("must reject ..");
         match err {
@@ -1144,29 +1120,6 @@ mod tests_skopeo {
 mod tests_online_oci {
     use super::*;
 
-    #[test]
-    #[ignore = "online: pulls alpine:latest via oci-distribution"]
-    fn native_pull_and_extract_alpine() {
-        use crate::console::StandardConsole;
-        use crate::vfs::TempVfs;
-
-        let fs = TempVfs::new().expect("tempvfs");
-        let target = fs.root.join("rootfs");
-        let stage = Stage {
-            unpack_images: vec![UnpackImageConf {
-                source: "docker.io/library/alpine:latest".into(),
-                target: target.display().to_string(),
-                platform: "".into(),
-            }],
-            ..Default::default()
-        };
-        let console = StandardConsole::new();
-        run(&stage, &fs, &console).expect("alpine native pull should succeed");
-        assert!(
-            target.join("bin/busybox").exists() || target.join("bin/sh").exists(),
-            "expected /bin/busybox or /bin/sh in extracted alpine rootfs",
-        );
-    }
 }
 
 // =====================================================================
@@ -1208,63 +1161,6 @@ mod tests_go_unpack_image_port {
         Ok(mach == EM_ARM || mach == EM_AARCH64)
     }
 
-    /// Go: "Extracts" — pulls quay.io/luet/base:latest and asserts
-    /// /tmp/unpack/usr/bin/luet exists.
-    #[test]
-    #[ignore = "online + root: pulls quay.io/luet/base:latest via OCI"]
-    fn go_port_extracts() {
-        if unsafe { libc::geteuid() } != 0 {
-            eprintln!("Skipping: must be run as root for extraction to work");
-            return;
-        }
-        let fs = TempVfs::new().expect("tempvfs");
-        let target = fs.root.join("unpack");
-        let stage = Stage {
-            unpack_images: vec![UnpackImageConf {
-                source: "quay.io/luet/base:latest".into(),
-                target: target.display().to_string(),
-                platform: "".into(),
-            }],
-            ..Default::default()
-        };
-        let console = RecordingConsole::new();
-        run(&stage, &fs, &console).expect("err nil");
-
-        // Go: Stat(target) ok + Stat("/tmp/unpack/usr/bin/luet") ok.
-        assert!(target.exists(), "{} should exist", target.display());
-        let luet = target.join("usr/bin/luet");
-        assert!(luet.exists(), "{} should exist", luet.display());
-    }
-
-    /// Go: "Extracts for a different platform" — platform=linux/arm64.
-    #[test]
-    #[ignore = "online + root: pulls quay.io/luet/base:latest@linux/arm64 via OCI"]
-    fn go_port_extracts_for_different_platform() {
-        if unsafe { libc::geteuid() } != 0 {
-            eprintln!("Skipping: must be run as root for extraction to work");
-            return;
-        }
-        let fs = TempVfs::new().expect("tempvfs");
-        let target = fs.root.join("unpack");
-        let stage = Stage {
-            unpack_images: vec![UnpackImageConf {
-                source: "quay.io/luet/base:latest".into(),
-                target: target.display().to_string(),
-                platform: "linux/arm64".into(),
-            }],
-            ..Default::default()
-        };
-        let console = RecordingConsole::new();
-        run(&stage, &fs, &console).expect("err nil");
-
-        assert!(target.exists());
-        let luet = target.join("usr/bin/luet");
-        assert!(luet.exists());
-
-        // Go: isARMBinary(...) should be true.
-        let is_arm = is_arm_binary(&luet).expect("read luet binary");
-        assert!(is_arm, "luet binary must be ARM/ARM64");
-    }
 }
 
 /// Online smoke test for the skopeo backend. Requires `skopeo` on $PATH.
@@ -1274,26 +1170,6 @@ mod tests_go_unpack_image_port {
 mod tests_online_skopeo {
     use super::*;
 
-    #[test]
-    #[ignore = "online: requires skopeo + network"]
-    fn skopeo_pull_and_extract_alpine() {
-        use crate::console::StandardConsole;
-        use crate::vfs::TempVfs;
-
-        let fs = TempVfs::new().expect("tempvfs");
-        let target = fs.root.join("rootfs");
-        let stage = Stage {
-            unpack_images: vec![UnpackImageConf {
-                source: "docker.io/library/alpine:latest".into(),
-                target: target.display().to_string(),
-                platform: "linux/amd64".into(),
-            }],
-            ..Default::default()
-        };
-        let console = StandardConsole::new();
-        run(&stage, &fs, &console).expect("alpine skopeo pull should succeed");
-        assert!(target.join("bin/busybox").exists() || target.join("bin/sh").exists());
-    }
 }
 
 // =====================================================================

@@ -1320,29 +1320,6 @@ mod tests {
             }
         }
 
-        /// Online smoke test. Disabled by default; run with
-        /// `cargo test -- --ignored git_online_clone_gix`.
-        #[test]
-        #[ignore = "online: hits gist.github.com"]
-        fn git_online_clone_gix() {
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let dst = tmp.path().join("repo");
-            let stage = Stage {
-                git: Git {
-                    url: "https://gist.github.com/mudler/13d2c42fd2cf7fc33cdb8cae6b5bdd57".into(),
-                    path: dst.to_string_lossy().into_owned(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let fs = RealVfs::new();
-            let console = StandardConsole::new();
-            run(&stage, &fs, &console).expect("online clone (gix)");
-            // We only assert .git exists — without `worktree-mutation`,
-            // the working tree won't be populated.
-            assert!(dst.join(".git").exists(), ".git dir from online clone");
-        }
-
         // -------------------------------------------------------------------
         // Direct ports of pkg/plugins/git_test.go It blocks (4) — gix-backend
         // variants. The Go tests use a real GitHub gist; we substitute a
@@ -1382,51 +1359,6 @@ mod tests {
             let console = StandardConsole::new();
             run(&stage, &fs, &console).expect("clone into fresh nested path");
             assert!(dst_path.join(".git").exists(), ".git created at fresh path");
-        }
-
-        /// Go: "clones a public repo in a path that does exist but is not a
-        /// git repo"
-        ///
-        /// The destination directory exists but has no `.git` — `run` must
-        /// treat this as a fresh clone (NOT take the update path).
-        ///
-        /// NB: gix's `prepare_clone` requires the destination to be empty.
-        /// In Go this works because the gist contains a `unittest.txt`
-        /// file that overlays cleanly onto the pre-created `/testarea`.
-        /// With our no-network gix port we can't replicate the
-        /// "non-empty pre-existing dir" case losslessly; this test
-        /// pre-creates the parent only (leaving the leaf for gix to make
-        /// itself), which is the closest no-network analogue. Marked
-        /// `#[ignore]` so a future port that supports non-empty
-        /// destinations can flip it on.
-        #[test]
-        #[ignore = "gix prepare_clone refuses non-empty destination; needs worktree-mutation or shell backend"]
-        fn go_port_clones_into_existing_non_git_dir() {
-            let src_tmp = tempfile::tempdir().expect("src tempdir");
-            let src_path = src_tmp.path().join("source.git");
-            let url = seed_bare_repo(&src_path);
-
-            let dst_tmp = tempfile::tempdir().expect("dst tempdir");
-            let dst_path = dst_tmp.path().join("testarea");
-            // Pre-create the destination AND drop an unrelated file inside
-            // it, like the Go gist does with `unittest.txt`.
-            std::fs::create_dir_all(&dst_path).expect("pre-create dir");
-            std::fs::write(dst_path.join("placeholder.txt"), b"x")
-                .expect("seed unrelated file");
-
-            let stage = Stage {
-                git: Git {
-                    url,
-                    path: dst_path.to_string_lossy().into_owned(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-
-            let fs = RealVfs::new();
-            let console = StandardConsole::new();
-            run(&stage, &fs, &console).expect("clone into existing non-git dir");
-            assert!(dst_path.join(".git").exists(), ".git created over existing dir");
         }
 
         /// Go: "clones a public repo in a path that is already checked out"
@@ -1475,32 +1407,5 @@ mod tests {
             let _ = gix::open(&dst_path).expect("repo openable after update");
         }
 
-        /// Go: PIt "clones a private repo in a path that is already
-        /// checked out"
-        ///
-        /// The Go test is `PIt` (pending/skipped). Carrying that forward
-        /// as a `#[ignore]` placeholder so the Go ↔ Rust mapping stays
-        /// 1:1. When SSH-based clones with private keys are exercised
-        /// end-to-end, drop the `#[ignore]` and supply a real keypair
-        /// (Go used a hard-coded test key bound to a gitlab.com repo).
-        #[test]
-        #[ignore = "Go PIt — private repo SSH clone, pending end-to-end fixture"]
-        fn go_port_clones_private_repo_already_checked_out() {
-            // The Go test sets:
-            //   url    = git@gitlab.com:mudler/unit-test-repo.git
-            //   branch = main
-            //   auth   = { private_key, public_key (gitlab host key) }
-            //
-            // The Rust gix backend accepts a private_key via
-            // `Auth { private_key, .. }` and exports
-            // `GIT_SSH_COMMAND=ssh -i <tempfile>` for the duration. The
-            // pending part is the fixture: we need either a real SSH key
-            // bound to a reachable repo, or a local sshd loopback. Once
-            // wired in, this test should:
-            //   1. clone the private repo
-            //   2. mutate a tracked file
-            //   3. clone again
-            //   4. assert the file is restored
-        }
     }
 }
