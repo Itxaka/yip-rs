@@ -128,7 +128,7 @@ Mirrors the 23 Go plugins. `Done` = full behavioural port. `Partial` = works for
 | `git` | Done | `gix` native or shell-out fallback. |
 | `layout` | Partial | gpt/mbr native; ext/xfs/btrfs grow via `resize2fs`/`xfs_growfs`/`btrfs` shell-out. |
 | `unpack_image` | Done | `oci-distribution` native or `skopeo` fallback; whiteouts supported. |
-| `datasource` | Partial | aws + nocloud only. Others (azure/gcp/openstack/...) stubbed. |
+| `datasource` | Done | All 14 Go providers: aws, nocloud, azure, gcp, openstack, digitalocean, scaleway, hetzner, packet, vultr, metaldata, vmware, cdrom, config-drive, file. |
 
 | Conditional | Status | Notes |
 |---|---|---|
@@ -136,7 +136,7 @@ Mirrors the 23 Go plugins. `Done` = full behavioural port. `Partial` = works for
 | `if` | Done | Shell-out boolean; non-zero exit = skip. |
 | `only_if_os` | Done | Parses /etc/os-release ID. |
 | `only_if_os_version` | Done | semver-ish comparison on os-release VERSION_ID. |
-| `if_arch` | Done | Uses Rust target arch. Note: `x86_64` not `amd64`. |
+| `if_arch` | Done | Aliases Rust target arch to Go names (`x86_64`→`amd64`, `aarch64`→`arm64`, …) so Go configs work unchanged. |
 | `if_service_manager` | Done | Detects systemd / openrc / runit. |
 | `if_files` | Done | `any` / `all` / `none` semantics. |
 
