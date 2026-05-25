@@ -6,10 +6,14 @@
 //! / pattern matches succeed, and an empty `only_arch` field is treated as
 //! "no filter, always run".
 //!
-//! Notable difference from Go: `runtime.GOARCH` uses Go names ("amd64",
-//! "arm64", ...) while Rust's `std::env::consts::ARCH` uses target-triple
-//! names ("x86_64", "aarch64", ...). User configs targeting yip-rs need to
-//! match against the Rust set.
+//! `runtime.GOARCH` uses Go names ("amd64", "arm64", ...) while Rust's
+//! `std::env::consts::ARCH` uses target-triple names ("x86_64", "aarch64",
+//! ...). To keep configs written for Go yip working unchanged, the regex is
+//! matched against BOTH the Rust arch string AND its Go equivalent (when one
+//! exists). Practically this means `only_arch: amd64` and
+//! `only_arch: x86_64` both run on an x86_64 host; `only_arch: arm64` and
+//! `only_arch: aarch64` both run on aarch64; etc. Arches whose Go and Rust
+//! names already agree (riscv64, mips64, s390x, ...) need no aliasing.
 
 use std::sync::Arc;
 
@@ -22,6 +26,23 @@ use crate::vfs::Vfs;
 /// Build the conditional. Closure pattern matches other conditionals.
 pub fn build() -> Conditional {
     Arc::new(check)
+}
+
+/// Map a Rust `std::env::consts::ARCH` value to the equivalent
+/// `runtime.GOARCH` string, when they differ. Returns `None` when the names
+/// already match (riscv64, mips64, s390x, ...) or when no Go equivalent is
+/// defined. The pairings come from Go's `src/internal/goarch/goarch.go` and
+/// Rust's target-triple set; only the values we expect to see in practice on
+/// Kairos-ish hosts are enumerated.
+fn go_arch_alias(rust_arch: &str) -> Option<&'static str> {
+    match rust_arch {
+        "x86_64" => Some("amd64"),
+        "aarch64" => Some("arm64"),
+        "x86" => Some("386"),
+        "powerpc64" => Some("ppc64"),
+        // riscv64, mips64, mips, s390x, arm, wasm32 — Go and Rust agree.
+        _ => None,
+    }
 }
 
 /// Pure function form — also exposed so tests don't need to invoke via Arc.
@@ -49,15 +70,23 @@ pub fn check(stage: &Stage, _fs: &dyn Vfs, _console: &dyn Console) -> Result<Con
 
     let arch = std::env::consts::ARCH;
     if re.is_match(arch) {
-        Ok(ConditionalOutcome::Run)
-    } else {
-        tracing::debug!(
-            arch = %arch,
-            only_arch = %stage.only_if_arch,
-            "arch does not match only_arch, skipping stage",
-        );
-        Ok(ConditionalOutcome::Skip)
+        return Ok(ConditionalOutcome::Run);
     }
+    // Try the Go-equivalent name so configs written for Go yip (e.g.
+    // `only_arch: amd64`) keep working on a Rust host where
+    // `std::env::consts::ARCH` is `x86_64`.
+    if let Some(go) = go_arch_alias(arch) {
+        if re.is_match(go) {
+            return Ok(ConditionalOutcome::Run);
+        }
+    }
+    tracing::debug!(
+        arch = %arch,
+        go_arch = ?go_arch_alias(arch),
+        only_arch = %stage.only_if_arch,
+        "arch does not match only_arch, skipping stage",
+    );
+    Ok(ConditionalOutcome::Skip)
 }
 
 #[cfg(test)]
@@ -268,5 +297,104 @@ mod tests {
         let out = check(&stage, &fs, &console).expect("check ok");
         assert_eq!(out, ConditionalOutcome::Run);
         assert!(console.commands().is_empty());
+    }
+
+    // --- Go-arch aliasing tests ---
+    //
+    // These exercise the `go_arch_alias` path: a config written using the
+    // Go `runtime.GOARCH` name (amd64, arm64, 386, ...) should still match
+    // on a Rust host whose `std::env::consts::ARCH` is the equivalent
+    // target-triple name (x86_64, aarch64, x86, ...).
+    //
+    // Each test is gated to the host arch that exercises the alias, since
+    // we can't override `env::consts::ARCH` at runtime. Off-arch hosts
+    // simply skip the gated assertion.
+
+    /// `only_if_arch: amd64` on x86_64 → Run (Go name → Rust host).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn go_alias_amd64_runs_on_x86_64() {
+        let stage = Stage {
+            only_if_arch: "amd64".into(),
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        let out = check(&stage, &fs, &console).expect("check ok");
+        assert_eq!(out, ConditionalOutcome::Run);
+    }
+
+    /// `only_if_arch: arm64` on x86_64 → Skip (different arch, alias must
+    /// not over-match).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn go_alias_arm64_skips_on_x86_64() {
+        let stage = Stage {
+            only_if_arch: "arm64".into(),
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        let out = check(&stage, &fs, &console).expect("check ok");
+        assert_eq!(out, ConditionalOutcome::Skip);
+    }
+
+    /// `only_if_arch: arm64` on aarch64 → Run (Go name → Rust host).
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn go_alias_arm64_runs_on_aarch64() {
+        let stage = Stage {
+            only_if_arch: "arm64".into(),
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        let out = check(&stage, &fs, &console).expect("check ok");
+        assert_eq!(out, ConditionalOutcome::Run);
+    }
+
+    /// `only_if_arch: (amd64|arm64)` on x86_64 → Run (alternation hitting
+    /// the Go alias for the host).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn go_alias_alternation_runs_on_x86_64() {
+        let stage = Stage {
+            only_if_arch: "(amd64|arm64)".into(),
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        let out = check(&stage, &fs, &console).expect("check ok");
+        assert_eq!(out, ConditionalOutcome::Run);
+    }
+
+    /// `only_if_arch: 386` on x86 → Run. Gated to 32-bit x86 hosts only.
+    #[test]
+    #[cfg(target_arch = "x86")]
+    fn go_alias_386_runs_on_x86() {
+        let stage = Stage {
+            only_if_arch: "386".into(),
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        let out = check(&stage, &fs, &console).expect("check ok");
+        assert_eq!(out, ConditionalOutcome::Run);
+    }
+
+    /// Pure function-level check of the alias table — runs on every host,
+    /// no `env::consts::ARCH` dependency.
+    #[test]
+    fn go_arch_alias_table() {
+        assert_eq!(go_arch_alias("x86_64"), Some("amd64"));
+        assert_eq!(go_arch_alias("aarch64"), Some("arm64"));
+        assert_eq!(go_arch_alias("x86"), Some("386"));
+        assert_eq!(go_arch_alias("powerpc64"), Some("ppc64"));
+        // Names that already agree between Go and Rust must not be aliased.
+        assert_eq!(go_arch_alias("riscv64"), None);
+        assert_eq!(go_arch_alias("s390x"), None);
+        assert_eq!(go_arch_alias("mips64"), None);
+        // Unknown arches map to None (caller falls back to Skip).
+        assert_eq!(go_arch_alias("not-a-real-arch"), None);
     }
 }

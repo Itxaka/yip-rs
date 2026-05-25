@@ -3,13 +3,12 @@
 //!
 //! Port of `pkg/plugins/dir.go::EnsureDirectories`. The Go version walks
 //! up the path tree manually, creating missing parents one at a time and
-//! applying permissions; we lean on [`Vfs::mkdir_all`] which does the
-//! ancestor walk for us, then apply `chmod` / `chown` on the final path.
-//! This preserves the user-visible behaviour (final dir has the requested
-//! perms; intermediates exist) — Go's per-level chown is a side-effect we
-//! don't try to replicate, since it depends on whether each ancestor was
-//! newly created vs already present, and the Go logic itself only applies
-//! perms on the top-level entry in that case.
+//! applying the user-supplied permissions / ownership to every component
+//! it creates. We replicate that behaviour here: walk the path's
+//! ancestor chain from the root, `mkdir` each segment, then apply
+//! `chmod` + `chown` (when set) at every level. This matches Go's
+//! observable side-effect where `/a/b/c/d` with mode `0o755` ends up
+//! with `0o755` on `/a`, `/a/b`, `/a/b/c`, and `/a/b/c/d`.
 //!
 //! Name-based owner/group is currently not supported: we log a warning and
 //! skip the chown. Adding `users`-crate lookups is tracked as a TODO.
@@ -17,7 +16,7 @@
 //! Per-directory errors are aggregated into [`Error::Multi`]; the loop
 //! never aborts early.
 
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use tracing::{debug, info, warn};
@@ -63,15 +62,74 @@ fn ensure_directory(dir: &Directory, fs: &dyn Vfs) -> Result<()> {
 
     let path = Path::new(&dir.path);
     debug!(path = %dir.path, "creating directory");
-    fs.mkdir_all(path)?;
 
-    if dir.permissions != 0 {
-        debug!(path = %dir.path, mode = format!("{:o}", dir.permissions), "chmod");
-        fs.chmod(path, dir.permissions)?;
+    let ancestors = iter_ancestors(path);
+    let target_idx = ancestors.len().saturating_sub(1);
+
+    // Walk the components. Mirrors Go's `writePath` recursion in
+    // `pkg/plugins/dir.go`:
+    //
+    //   * Top-level target: if it already exists, only chmod+chown it
+    //     (does not touch parents); if it doesn't, recurse upward.
+    //   * Intermediate parents: chmod+chown only when *newly created*.
+    //     Pre-existing intermediates are left alone.
+    //
+    // We approximate this by checking `fs.exists` before mkdir. If it
+    // doesn't exist (or it's the top-level target), we mkdir + chmod +
+    // chown. If it already exists and isn't the leaf, leave it alone.
+    for (idx, segment) in ancestors.iter().enumerate() {
+        let is_leaf = idx == target_idx;
+        let pre_existed = fs.exists(segment);
+        fs.mkdir_all(segment)?;
+
+        // Apply perms+chown when we just created this dir, OR when it's
+        // the top-level target (Go always touches the top-level even if
+        // it already exists).
+        if !pre_existed || is_leaf {
+            if dir.permissions != 0 {
+                debug!(path = %segment.display(), mode = format!("{:o}", dir.permissions), "chmod");
+                fs.chmod(segment, dir.permissions)?;
+            }
+            apply_chown(segment, &dir.owner, dir.group, fs)?;
+        }
     }
-
-    apply_chown(path, &dir.owner, dir.group, fs)?;
     Ok(())
+}
+
+/// Build the ordered list of ancestor paths to mkdir/chmod/chown for a
+/// target directory, including the target itself.
+///
+/// Examples:
+///   - `/a/b/c`        -> [`/a`, `/a/b`, `/a/b/c`]
+///   - `relative/x`    -> [`relative`, `relative/x`]
+///   - `/`             -> [] (root is never created)
+///
+/// We skip the bare root because Go does too: the loop walks from the
+/// shallowest *creatable* directory upward.
+fn iter_ancestors(path: &Path) -> Vec<PathBuf> {
+    let mut acc: Vec<PathBuf> = Vec::new();
+    let mut current = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            // The leading `/` on an absolute path becomes the prefix for
+            // every subsequent segment; we don't emit `/` itself.
+            Component::RootDir => current.push("/"),
+            Component::Prefix(p) => current.push(p.as_os_str()),
+            Component::CurDir => continue,
+            // `..` is unusual in a directories entry but Go would walk
+            // through it. Push and emit so the resulting path matches the
+            // user-supplied string.
+            Component::ParentDir => {
+                current.push("..");
+                acc.push(current.clone());
+            }
+            Component::Normal(seg) => {
+                current.push(seg);
+                acc.push(current.clone());
+            }
+        }
+    }
+    acc
 }
 
 /// Apply ownership when `owner` or `group` is set. Name-based owners are
@@ -425,6 +483,77 @@ mod tests {
         run(&stage, &fs, &console).expect("err nil");
         let m = fs.metadata(Path::new("/tmp/dir")).expect("post-stat");
         assert_eq!(m.mode & 0o7777, 0o740);
+    }
+
+    // -------------------------------------------------------------------
+    // New tests for the Go-matching per-level chmod/chown behaviour.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn nested_path_applies_mode_to_every_intermediate() {
+        // Go applies the requested permissions to each intermediate dir
+        // created along the path. Our port must do the same: every
+        // ancestor of /a/b/c/d (including /a, /a/b, /a/b/c) ends up at
+        // 0o750 — not just the leaf.
+        let stage = Stage {
+            directories: vec![Directory {
+                path: "/a/b/c/d".to_string(),
+                permissions: 0o750,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        run(&stage, &fs, &console).expect("ok");
+
+        for p in ["/a", "/a/b", "/a/b/c", "/a/b/c/d"] {
+            let m = fs.metadata(Path::new(p)).expect("metadata");
+            assert!(m.is_dir, "{p} should be a directory");
+            assert_eq!(
+                m.mode & 0o7777,
+                0o750,
+                "{p} should have mode 0o750"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_path_applies_owner_group_to_every_intermediate() {
+        // chown propagation: every intermediate parent gets the same
+        // uid/gid as the leaf. Mirrors Go's per-segment os.Chown call.
+        let stage = Stage {
+            directories: vec![Directory {
+                path: "/x/y/z".to_string(),
+                permissions: 0o755,
+                owner: OwnerId::Numeric(2000),
+                group: 3000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        run(&stage, &fs, &console).expect("ok");
+
+        for p in ["/x", "/x/y", "/x/y/z"] {
+            let m = fs.metadata(Path::new(p)).expect("metadata");
+            assert_eq!(
+                (m.uid, m.gid),
+                (2000, 3000),
+                "{p} should be owned by uid=2000 gid=3000"
+            );
+        }
+    }
+
+    #[test]
+    fn iter_ancestors_returns_components_in_order() {
+        let ancestors = iter_ancestors(Path::new("/a/b/c"));
+        let strs: Vec<String> = ancestors
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        assert_eq!(strs, vec!["/a", "/a/b", "/a/b/c"]);
     }
 
     /// Go: "Creates /tmp/dir/subdir1/subdir2 directory and its missing parent dirs"

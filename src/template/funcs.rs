@@ -17,7 +17,9 @@
 use std::collections::HashMap;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use chrono::{Duration, Utc};
+use bcrypt::{hash, DEFAULT_COST};
+use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono_tz::Tz;
 use md5::Md5;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
@@ -736,6 +738,20 @@ fn fn_rand_numeric(args: &HashMap<String, Value>) -> TeraResult<Value> {
     Ok(Value::String(s))
 }
 
+// Sprig `htpasswd "user" "pass"` -> apache htpasswd line `user:$2y$10$<bcrypt>`.
+// Registered as a tera function (sprig invokes it variadically); we expose both
+// the camelCase sprig name and a snake_case alias.
+fn fn_htpasswd(args: &HashMap<String, Value>) -> TeraResult<Value> {
+    let user = first_positional(args, &["user", "0"])
+        .map(|v| arg_string(&v))
+        .ok_or_else(|| err("htpasswd: missing user"))?;
+    let pass = first_positional(args, &["pass", "password", "1"])
+        .map(|v| arg_string(&v))
+        .ok_or_else(|| err("htpasswd: missing pass"))?;
+    let h = hash(&pass, DEFAULT_COST).map_err(|e| err(format!("htpasswd: bcrypt: {e}")))?;
+    Ok(Value::String(format!("{user}:{h}")))
+}
+
 // ---------------------------------------------------------------------------
 // Date
 
@@ -752,39 +768,113 @@ fn f_date(value: &Value, args: &HashMap<String, Value>) -> TeraResult<Value> {
     let fmt = first_positional(args, &["format", "fmt", "0"])
         .map(|v| arg_string(&v))
         .ok_or_else(|| err("date: missing format"))?;
-    let chrono_fmt = go_time_layout_to_chrono(&fmt);
-    let when = match value {
-        Value::Null => Utc::now(),
-        Value::String(s) => chrono::DateTime::parse_from_rfc3339(s)
-            .map(|t| t.with_timezone(&Utc))
-            .map_err(|e| err(format!("date: bad input time: {e}")))?,
-        _ => Utc::now(),
-    };
+    let chrono_fmt = translate_go_layout(&fmt);
+    let when = parse_value_to_utc(value).unwrap_or_else(|_| Utc::now());
     Ok(Value::String(when.format(&chrono_fmt).to_string()))
 }
 
 fn f_date_in_zone(value: &Value, args: &HashMap<String, Value>) -> TeraResult<Value> {
-    // TODO(sprig): proper `dateInZone` needs chrono-tz to look up arbitrary
-    // zone names. yip-rs pulls chrono with `default-features = false` and
-    // no chrono-tz, so we approximate by ignoring the zone and rendering UTC.
-    f_date(value, args)
+    // sprig `dateInZone LAYOUT DATE ZONE`. As filter: `DATE | dateInZone(format, zone)`.
+    // ZONE is any IANA tz name resolvable by chrono-tz (e.g. "America/New_York",
+    // "Europe/Madrid", "UTC"). LAYOUT is either a Go reference-time format
+    // (translated below) or a literal chrono strftime string.
+    let layout = first_positional(args, &["format", "fmt", "layout", "0"])
+        .map(|v| arg_string(&v))
+        .unwrap_or_else(|| "%Y-%m-%dT%H:%M:%SZ".to_string());
+    let zone = first_positional(args, &["zone", "tz", "1"])
+        .map(|v| arg_string(&v))
+        .unwrap_or_else(|| "UTC".to_string());
+
+    let dt_utc =
+        parse_value_to_utc(value).map_err(|e| err(format!("dateInZone: {e}")))?;
+    let tz: Tz = zone
+        .parse()
+        .map_err(|e| err(format!("dateInZone: bad zone {zone:?}: {e:?}")))?;
+    let local = dt_utc.with_timezone(&tz);
+    Ok(Value::String(local.format(&translate_go_layout(&layout)).to_string()))
 }
 
-fn go_time_layout_to_chrono(layout: &str) -> String {
-    // Translate the most common Go reference-time tokens. The Go reference
-    // time is "Mon Jan 2 15:04:05 MST 2006" — each component is a literal
-    // token. This is not a full implementation but covers the typical
-    // configs we see in kairos.
-    layout
-        .replace("2006", "%Y")
-        .replace("01", "%m")
-        .replace("02", "%d")
-        .replace("15", "%H")
-        .replace("04", "%M")
-        .replace("05", "%S")
-        .replace("Jan", "%b")
-        .replace("Mon", "%a")
-        .replace("MST", "%Z")
+/// Parse a tera `Value` as a UTC `DateTime`:
+///   - `Null` -> "now"
+///   - RFC3339 string -> parsed
+///   - numeric (or numeric-string) -> Unix epoch seconds
+fn parse_value_to_utc(value: &Value) -> TeraResult<DateTime<Utc>> {
+    match value {
+        Value::Null => Ok(Utc::now()),
+        Value::String(s) => {
+            if let Ok(t) = chrono::DateTime::parse_from_rfc3339(s) {
+                return Ok(t.with_timezone(&Utc));
+            }
+            if let Ok(n) = s.parse::<i64>() {
+                return Utc
+                    .timestamp_opt(n, 0)
+                    .single()
+                    .ok_or_else(|| err(format!("bad unix timestamp {n}")));
+            }
+            Err(err(format!("bad input time: {s:?}")))
+        }
+        Value::Number(n) => {
+            let i = n
+                .as_i64()
+                .or_else(|| n.as_f64().map(|f| f as i64))
+                .ok_or_else(|| err("bad input time: numeric out of range"))?;
+            Utc.timestamp_opt(i, 0)
+                .single()
+                .ok_or_else(|| err(format!("bad unix timestamp {i}")))
+        }
+        _ => Err(err("input is not a date string or timestamp")),
+    }
+}
+
+/// Translate Go's reference-time layout ("Mon Jan 2 15:04:05 MST 2006") into
+/// chrono's strftime syntax. Done by longest-prefix token matching so that
+/// e.g. "2006" is consumed as one token (not as "20" + "06"), and unknown
+/// characters pass through verbatim.
+///
+/// If `layout` already looks like strftime (first non-whitespace char is `%`),
+/// it is returned unchanged so callers can opt into chrono's syntax directly.
+fn translate_go_layout(layout: &str) -> String {
+    if layout.trim_start().starts_with('%') {
+        return layout.to_string();
+    }
+    // (go_token, chrono_token). Order matters: longer tokens that share a
+    // prefix with shorter ones must come first.
+    const TOKENS: &[(&str, &str)] = &[
+        ("January", "%B"),
+        ("Monday", "%A"),
+        ("2006", "%Y"),
+        ("Jan", "%b"),
+        ("Mon", "%a"),
+        ("MST", "%Z"),
+        ("-0700", "%z"),
+        ("15", "%H"),
+        ("04", "%M"),
+        ("05", "%S"),
+        ("01", "%m"),
+        ("02", "%d"),
+    ];
+    let bytes = layout.as_bytes();
+    let mut out = String::with_capacity(layout.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &layout[i..];
+        let mut matched = false;
+        for (go, chr) in TOKENS {
+            if rest.starts_with(go) {
+                out.push_str(chr);
+                i += go.len();
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            // Walk one UTF-8 char at a time to keep multi-byte characters intact.
+            let ch = rest.chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1582,7 +1672,8 @@ fn fn_semver_compare(args: &HashMap<String, Value>) -> TeraResult<Value> {
 //   Conv:      int, int64, float, toString, toBool, toJson, toYaml,
 //              fromJson, fromYaml
 //   Encoding:  b64enc, b64dec, sha256sum, sha512sum, md5sum,
-//              randAlphaNum [fn], randAlpha [fn], randNumeric [fn]
+//              randAlphaNum [fn], randAlpha [fn], randNumeric [fn],
+//              htpasswd [fn] (bcrypt-backed)
 //   Date:      now [fn], date, dateInZone, dateModify, mustDateModify,
 //              unixEpoch
 //   OS:        env [fn], expandenv [fn + filter], tempDir [fn]
@@ -1597,9 +1688,7 @@ fn fn_semver_compare(args: &HashMap<String, Value>) -> TeraResult<Value> {
 //              parser — no `semver` crate dep added.
 //
 // TODO(sprig): not yet ported (add when a kairos config needs them):
-//   - htpasswd / bcrypt / derivePassword / genPrivateKey
-//     (bcrypt is not in deps — htpasswd requires hand-rolling or a new crate
-//     dependency; punted per scoping guidance)
+//   - derivePassword / genPrivateKey
 
 pub fn register_all(t: &mut Tera) {
     // Strings
@@ -1694,6 +1783,7 @@ pub fn register_all(t: &mut Tera) {
     t.register_function("rand_alpha", fn_rand_alpha);
     t.register_function("randNumeric", fn_rand_numeric);
     t.register_function("rand_numeric", fn_rand_numeric);
+    t.register_function("htpasswd", fn_htpasswd);
 
     // Date
     t.register_function("now", fn_now);
@@ -1784,7 +1874,6 @@ pub fn register_all(t: &mut Tera) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::template::engine::render;
     use serde_json::{json, Value};
 
@@ -2261,8 +2350,7 @@ mod tests {
 
     #[test]
     fn date_in_zone_with_specific_input_time() {
-        // dateInZone currently approximates by ignoring the zone and
-        // rendering UTC (see f_date_in_zone). Verify the format pass.
+        // Plain UTC pass: the rendered date matches the input date.
         let data = json!({"t": "2024-03-15T12:34:56Z"});
         let out = render(
             r#"{{ .t | dateInZone(format="2006-01-02", zone="UTC") }}"#,
@@ -2270,6 +2358,80 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, "2024-03-15");
+    }
+
+    #[test]
+    fn date_in_zone_new_york_keeps_date_at_noon_utc() {
+        // 2024-06-15T12:00:00Z is noon UTC; NY is UTC-4 in June (EDT), so the
+        // local time is 08:00 same calendar day — date must still be 2024-06-15.
+        let data = json!({"t": "2024-06-15T12:00:00Z"});
+        let out = render(
+            r#"{{ .t | dateInZone(format="2006-01-02", zone="America/New_York") }}"#,
+            &data,
+        )
+        .unwrap();
+        assert_eq!(out, "2024-06-15");
+    }
+
+    #[test]
+    fn date_in_zone_tokyo_keeps_date_at_noon_utc() {
+        // 2024-06-15T12:00:00Z is noon UTC; Tokyo is UTC+9, so local time is
+        // 21:00 same calendar day — date still 2024-06-15.
+        let data = json!({"t": "2024-06-15T12:00:00Z"});
+        let out = render(
+            r#"{{ .t | dateInZone(format="2006-01-02", zone="Asia/Tokyo") }}"#,
+            &data,
+        )
+        .unwrap();
+        assert_eq!(out, "2024-06-15");
+    }
+
+    #[test]
+    fn date_in_zone_time_only_layout_in_new_york() {
+        // Midnight UTC on 2024-01-01 = NY 19:00 on 2023-12-31 (EST, UTC-5).
+        // The TIME portion should read "19:00:00".
+        let data = json!({"t": "2024-01-01T00:00:00Z"});
+        let out = render(
+            r#"{{ .t | dateInZone(format="15:04:05", zone="America/New_York") }}"#,
+            &data,
+        )
+        .unwrap();
+        assert_eq!(out, "19:00:00");
+    }
+
+    #[test]
+    fn date_in_zone_bad_zone_errors() {
+        let data = json!({"t": "2024-06-15T12:00:00Z"});
+        let res = render(
+            r#"{{ .t | dateInZone(format="2006-01-02", zone="Not/A_Zone") }}"#,
+            &data,
+        );
+        assert!(res.is_err(), "expected dateInZone to error on bad zone");
+    }
+
+    #[test]
+    fn date_in_zone_strftime_layout_passthrough() {
+        // A layout that already starts with `%` should be passed straight to
+        // chrono::format without translation.
+        let data = json!({"t": "2024-06-15T12:00:00Z"});
+        let out = render(
+            r#"{{ .t | dateInZone(format="%Y", zone="UTC") }}"#,
+            &data,
+        )
+        .unwrap();
+        assert_eq!(out, "2024");
+    }
+
+    #[test]
+    fn date_in_zone_madrid_summer_offset() {
+        // Sanity: Madrid in June is CEST (UTC+2). 10:00 UTC -> 12:00 local.
+        let data = json!({"t": "2024-06-15T10:00:00Z"});
+        let out = render(
+            r#"{{ .t | dateInZone(format="15:04:05", zone="Europe/Madrid") }}"#,
+            &data,
+        )
+        .unwrap();
+        assert_eq!(out, "12:00:00");
     }
 
     #[test]
@@ -2603,5 +2765,49 @@ mod tests {
         let data = json!({"v": "not.a.version"});
         let out = render(r#"{{ semver(version=.v) }}"#, &data).unwrap();
         assert_eq!(out, "");
+    }
+
+    // -----------------------------------------------------------------------
+    // htpasswd
+    //
+    // Output shape only — bcrypt embeds a random salt so the exact hash
+    // differs every call. We pin the `user:$2` prefix (bcrypt MCF marker)
+    // and a sane total length, and assert two invocations diverge.
+
+    #[test]
+    fn htpasswd_shape() {
+        use pretty_assertions::assert_eq;
+        let out = r(r#"{{ htpasswd(user="alice", pass="hunter2") }}"#);
+        assert!(
+            out.starts_with("alice:$2"),
+            "expected `alice:$2…` bcrypt MCF prefix, got {out:?}",
+        );
+        // `<user>:` + bcrypt MCF (60 chars): `$2{a,b,y}$<cost>$<22-salt><31-hash>`.
+        assert_eq!(
+            out.len(),
+            "alice:".len() + 60,
+            "unexpected htpasswd line length: {out:?}",
+        );
+    }
+
+    #[test]
+    fn htpasswd_random_salt_per_call() {
+        use pretty_assertions::assert_ne;
+        let a = r(r#"{{ htpasswd(user="alice", pass="hunter2") }}"#);
+        let b = r(r#"{{ htpasswd(user="alice", pass="hunter2") }}"#);
+        assert_ne!(
+            a, b,
+            "bcrypt salt must be random — same call produced identical hashes",
+        );
+    }
+
+    #[test]
+    fn htpasswd_missing_args_error() {
+        // Missing pass.
+        let res = render(r#"{{ htpasswd(user="alice") }}"#, &Value::Null);
+        assert!(res.is_err(), "expected error for missing pass, got {res:?}");
+        // Missing user.
+        let res = render(r#"{{ htpasswd(pass="hunter2") }}"#, &Value::Null);
+        assert!(res.is_err(), "expected error for missing user, got {res:?}");
     }
 }

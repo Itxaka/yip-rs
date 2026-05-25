@@ -27,7 +27,9 @@ use tracing::{debug, info, warn};
 use crate::console::Console;
 use crate::error::{Error, Result};
 use crate::executor::Plugin;
-use crate::schema::file::{File, OwnerId};
+use crate::schema::file::File;
+#[cfg(test)]
+use crate::schema::file::OwnerId;
 use crate::schema::Stage;
 use crate::vfs::Vfs;
 

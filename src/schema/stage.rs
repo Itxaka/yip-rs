@@ -136,7 +136,12 @@ pub struct Stage {
     #[serde(default, rename = "name", skip_serializing_if = "String::is_empty")]
     pub name: String,
     /// `sysctl` key/value pairs. YAML key: `sysctl`.
-    #[serde(default, rename = "sysctl", skip_serializing_if = "HashMap::is_empty")]
+    #[serde(
+        default,
+        rename = "sysctl",
+        deserialize_with = "deserialize_string_map_lenient",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
     pub sysctl: HashMap<String, String>,
 
     /// Authorised SSH keys per user. Maps `user → [keys]`. `SSHKeys` in
@@ -169,6 +174,7 @@ pub struct Stage {
     #[serde(
         default,
         rename = "environment",
+        deserialize_with = "deserialize_string_map_lenient",
         skip_serializing_if = "HashMap::is_empty"
     )]
     pub environment: HashMap<String, String>,
@@ -186,6 +192,7 @@ pub struct Stage {
     #[serde(
         default,
         rename = "package_pins",
+        deserialize_with = "deserialize_string_map_lenient",
         skip_serializing_if = "HashMap::is_empty"
     )]
     pub package_pins: PackagePins,
@@ -223,6 +230,7 @@ pub struct Stage {
     #[serde(
         default,
         rename = "systemd_firstboot",
+        deserialize_with = "deserialize_string_map_lenient",
         skip_serializing_if = "HashMap::is_empty"
     )]
     pub systemd_firstboot: HashMap<String, String>,
@@ -232,6 +240,7 @@ pub struct Stage {
     #[serde(
         default,
         rename = "timesyncd",
+        deserialize_with = "deserialize_string_map_lenient",
         skip_serializing_if = "HashMap::is_empty"
     )]
     pub timesyncd: HashMap<String, String>,
@@ -289,6 +298,50 @@ fn layout_is_default(l: &Layout) -> bool {
 }
 fn git_is_default(g: &Git) -> bool {
     g == &Git::default()
+}
+
+/// Lenient deserializer for `HashMap<String, String>` fields.
+///
+/// Accepts any scalar YAML value (string, int, float, bool, null) and
+/// stringifies it. This matches real-world configs that use bare
+/// integers in `sysctl`, `environment`, etc. where strict serde
+/// behaviour would otherwise reject the value.
+fn deserialize_string_map_lenient<'de, D>(
+    d: D,
+) -> std::result::Result<HashMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, MapAccess, Visitor};
+    use std::fmt;
+    struct V;
+    impl<'de> Visitor<'de> for V {
+        type Value = HashMap<String, String>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a YAML map where values may be strings, ints, floats, or bools")
+        }
+        fn visit_map<A: MapAccess<'de>>(
+            self,
+            mut m: A,
+        ) -> Result<HashMap<String, String>, A::Error> {
+            let mut out = HashMap::new();
+            while let Some((k, v)) = m.next_entry::<String, serde_yaml::Value>()? {
+                let s = match v {
+                    serde_yaml::Value::String(s) => s,
+                    serde_yaml::Value::Number(n) => n.to_string(),
+                    serde_yaml::Value::Bool(b) => b.to_string(),
+                    serde_yaml::Value::Null => String::new(),
+                    other => serde_yaml::to_string(&other)
+                        .map_err(de::Error::custom)?
+                        .trim_end()
+                        .to_string(),
+                };
+                out.insert(k, s);
+            }
+            Ok(out)
+        }
+    }
+    d.deserialize_map(V)
 }
 
 #[cfg(test)]
@@ -387,5 +440,125 @@ mod tests {
         let txt = serde_yaml::to_string(&s).unwrap();
         let back: Stage = serde_yaml::from_str(&txt).unwrap();
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn sysctl_accepts_bare_integer() {
+        let y = indoc! {r#"
+            sysctl:
+              foo: 100
+        "#};
+        let s: Stage = serde_yaml::from_str(y).unwrap();
+        assert_eq!(s.sysctl.get("foo").unwrap(), "100");
+    }
+
+    #[test]
+    fn sysctl_accepts_bare_float() {
+        let y = indoc! {r#"
+            sysctl:
+              foo: 1.5
+        "#};
+        let s: Stage = serde_yaml::from_str(y).unwrap();
+        assert_eq!(s.sysctl.get("foo").unwrap(), "1.5");
+    }
+
+    #[test]
+    fn sysctl_accepts_bool() {
+        let y = indoc! {r#"
+            sysctl:
+              foo: true
+        "#};
+        let s: Stage = serde_yaml::from_str(y).unwrap();
+        assert_eq!(s.sysctl.get("foo").unwrap(), "true");
+    }
+
+    #[test]
+    fn sysctl_accepts_quoted_string() {
+        let y = indoc! {r#"
+            sysctl:
+              foo: "100"
+        "#};
+        let s: Stage = serde_yaml::from_str(y).unwrap();
+        assert_eq!(s.sysctl.get("foo").unwrap(), "100");
+    }
+
+    #[test]
+    fn environment_accepts_bare_string() {
+        let y = indoc! {r#"
+            environment:
+              PATH: /bin
+        "#};
+        let s: Stage = serde_yaml::from_str(y).unwrap();
+        assert_eq!(s.environment.get("PATH").unwrap(), "/bin");
+    }
+
+    #[test]
+    fn systemd_firstboot_accepts_bare_string() {
+        let y = indoc! {r#"
+            systemd_firstboot:
+              hostname: kairos
+        "#};
+        let s: Stage = serde_yaml::from_str(y).unwrap();
+        assert_eq!(s.systemd_firstboot.get("hostname").unwrap(), "kairos");
+    }
+
+    #[test]
+    fn sysctl_mixed_types_in_same_map() {
+        let y = indoc! {r#"
+            sysctl:
+              a: 100
+              b: "200"
+              c: true
+        "#};
+        let s: Stage = serde_yaml::from_str(y).unwrap();
+        assert_eq!(s.sysctl.get("a").unwrap(), "100");
+        assert_eq!(s.sysctl.get("b").unwrap(), "200");
+        assert_eq!(s.sysctl.get("c").unwrap(), "true");
+    }
+
+    #[test]
+    fn sysctl_real_world_kernel_keys() {
+        let y = indoc! {r#"
+            sysctl:
+              net.core.rmem_max: 7500000
+              net.ipv4.ip_forward: 1
+        "#};
+        let s: Stage = serde_yaml::from_str(y).unwrap();
+        assert_eq!(s.sysctl.get("net.core.rmem_max").unwrap(), "7500000");
+        assert_eq!(s.sysctl.get("net.ipv4.ip_forward").unwrap(), "1");
+    }
+
+    #[test]
+    fn environment_accepts_integer() {
+        let y = indoc! {r#"
+            environment:
+              MAX_THREADS: 8
+        "#};
+        let s: Stage = serde_yaml::from_str(y).unwrap();
+        assert_eq!(s.environment.get("MAX_THREADS").unwrap(), "8");
+    }
+
+    #[test]
+    fn package_pins_accepts_integer_version() {
+        let y = indoc! {r#"
+            package_pins:
+              foo: 1
+              bar: "1.2.3"
+        "#};
+        let s: Stage = serde_yaml::from_str(y).unwrap();
+        assert_eq!(s.package_pins.get("foo").unwrap(), "1");
+        assert_eq!(s.package_pins.get("bar").unwrap(), "1.2.3");
+    }
+
+    #[test]
+    fn timesyncd_accepts_integer() {
+        let y = indoc! {r#"
+            timesyncd:
+              PollIntervalMaxSec: 2048
+              NTP: pool.ntp.org
+        "#};
+        let s: Stage = serde_yaml::from_str(y).unwrap();
+        assert_eq!(s.timesyncd.get("PollIntervalMaxSec").unwrap(), "2048");
+        assert_eq!(s.timesyncd.get("NTP").unwrap(), "pool.ntp.org");
     }
 }

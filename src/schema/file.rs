@@ -58,23 +58,39 @@ impl Serialize for OwnerId {
 
 impl<'de> Deserialize<'de> for OwnerId {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Helper {
-            Int(i64),
-            Str(String),
-        }
-        match Helper::deserialize(d)? {
-            Helper::Int(n) => Ok(OwnerId::Numeric(n as i32)),
-            Helper::Str(s) => {
-                // Accept "1000" as numeric too.
-                if let Ok(n) = s.parse::<i32>() {
-                    Ok(OwnerId::Numeric(n))
-                } else {
-                    Ok(OwnerId::Name(s))
-                }
+        // Diverges from a naive `untagged` enum: a YAML *integer* becomes
+        // `Numeric`, a YAML *string* (even one containing only digits, e.g.
+        // a quoted `"1000"`) stays as `Name`. This matches Go yip, where a
+        // quoted-string owner is fed through `id -u <name>` instead of
+        // being parsed numerically — real configs use the quoted form
+        // intentionally to defer resolution to runtime.
+        use serde::de::{self, Visitor};
+        use std::fmt;
+
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = OwnerId;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an integer UID/GID or a string name")
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<OwnerId, E> {
+                i32::try_from(v)
+                    .map(OwnerId::Numeric)
+                    .map_err(|_| de::Error::custom("owner: i32 out of range"))
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<OwnerId, E> {
+                i32::try_from(v)
+                    .map(OwnerId::Numeric)
+                    .map_err(|_| de::Error::custom("owner: i32 out of range"))
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<OwnerId, E> {
+                Ok(OwnerId::Name(v.to_string()))
+            }
+            fn visit_string<E: de::Error>(self, v: String) -> std::result::Result<OwnerId, E> {
+                Ok(OwnerId::Name(v))
             }
         }
+        d.deserialize_any(V)
     }
 }
 
@@ -239,13 +255,55 @@ mod tests {
     }
 
     #[test]
-    fn file_quoted_numeric_string_owner_is_numeric() {
+    fn file_bare_int_owner_is_numeric() {
+        // YAML bare integer → Numeric.
+        let y = indoc! {r#"
+            path: /etc/foo
+            owner: 1000
+        "#};
+        let f: File = serde_yaml::from_str(y).unwrap();
+        assert_eq!(f.owner, OwnerId::Numeric(1000));
+    }
+
+    #[test]
+    fn file_quoted_numeric_string_owner_is_preserved_as_name() {
+        // Quoted-numeric → Name (matches Go yip: defers to `id -u <name>`
+        // at runtime rather than collapsing to an int at parse time).
         let y = indoc! {r#"
             path: /etc/foo
             owner: "1000"
         "#};
         let f: File = serde_yaml::from_str(y).unwrap();
-        assert_eq!(f.owner, OwnerId::Numeric(1000));
+        assert_eq!(f.owner, OwnerId::Name("1000".to_string()));
+    }
+
+    #[test]
+    fn file_bare_ident_owner_is_name() {
+        let y = indoc! {r#"
+            path: /etc/foo
+            owner: alice
+        "#};
+        let f: File = serde_yaml::from_str(y).unwrap();
+        assert_eq!(f.owner, OwnerId::Name("alice".to_string()));
+    }
+
+    #[test]
+    fn ownerid_name_with_digit_only_string_roundtrips_quoted() {
+        // Serializing OwnerId::Name("1000") must emit a quoted string in YAML,
+        // and round-tripping must NOT collapse it to Numeric.
+        let f = File {
+            path: "/etc/foo".into(),
+            owner: OwnerId::Name("1000".into()),
+            ..Default::default()
+        };
+        let s = serde_yaml::to_string(&f).unwrap();
+        // serde_yaml quotes strings that would otherwise parse as scalars.
+        assert!(
+            s.contains("owner: '1000'") || s.contains("owner: \"1000\""),
+            "expected quoted owner, got: {s}",
+        );
+        let back: File = serde_yaml::from_str(&s).unwrap();
+        assert_eq!(back.owner, OwnerId::Name("1000".into()));
     }
 
     #[test]

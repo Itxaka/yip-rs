@@ -2118,8 +2118,10 @@ fn fuzz_owner_string_form_accepted() {
     let cfg = Config::load(y.as_bytes()).expect("owner string variants");
     let files = &cfg.stages["s"][0].files;
     assert_eq!(files[0].owner, OwnerId::Name("alice".into()));
-    // quoted numeric strings should normalise to numeric per file.rs comment
-    assert_eq!(files[1].owner, OwnerId::Numeric(1000));
+    // Quoted-string owners stay as Name even when the contents are all digits;
+    // see the OwnerId Deserialize impl — Go yip defers `"1000"` resolution to
+    // runtime rather than coercing it to an int at parse time.
+    assert_eq!(files[1].owner, OwnerId::Name("1000".into()));
     assert_eq!(files[2].owner_string, "bob");
 }
 

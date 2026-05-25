@@ -1,20 +1,23 @@
 //! Port of `pkg/plugins/timesyncd.go`.
 //!
 //! Renders the stage's `timesyncd` map as an INI-format `[Time]` section
-//! and writes it to `/etc/systemd/timesyncd.conf`. The Go plugin uses
-//! `gopkg.in/ini.v1` to load → merge → save, which means any
+//! and writes it to `/etc/systemd/timesyncd.conf.d/10-yip.conf` (a drop-in
+//! file that systemd-timesyncd merges on top of the distro-shipped
+//! `/etc/systemd/timesyncd.conf`). The Go plugin writes to the same
+//! drop-in path via `gopkg.in/ini.v1` (load → merge → save), so the
 //! pre-existing keys outside the touched ones are preserved.
 //!
-//! This port intentionally writes the file directly with a deterministic
-//! layout (alphabetically sorted keys, `KEY=VALUE` with no surrounding
-//! whitespace) and overwrites whatever is at the target path. yip's
-//! schema always ships the full intended `[Time]` block, so merging on
-//! top of a partial file isn't useful in practice, and a stable rendering
-//! is easier to diff / audit / test against.
+//! This Rust port intentionally writes the file directly with a
+//! deterministic layout (alphabetically sorted keys, `KEY=VALUE` with no
+//! surrounding whitespace) and overwrites whatever is at the target path.
+//! yip's schema always ships the full intended `[Time]` block, so merging
+//! on top of a partial file isn't useful in practice, and a stable
+//! rendering is easier to diff / audit / test against.
 //!
 //! Behaviour summary:
 //!   - empty map → no write at all.
-//!   - non-empty map → overwrite `/etc/systemd/timesyncd.conf` with
+//!   - non-empty map → ensure `/etc/systemd/timesyncd.conf.d/` exists,
+//!     then write `/etc/systemd/timesyncd.conf.d/10-yip.conf` with
 //!     `[Time]\n<key>=<value>\n...` using alphabetically-sorted keys.
 
 use std::path::Path;
@@ -28,13 +31,18 @@ use crate::executor::Plugin;
 use crate::schema::Stage;
 use crate::vfs::Vfs;
 
-const TIMESYNCD_CONF: &str = "/etc/systemd/timesyncd.conf";
+/// Target drop-in path. Matches the Go plugin which writes to the
+/// `.conf.d/` directory rather than the top-level config — this preserves
+/// distro-shipped defaults that systemd-timesyncd reads via its standard
+/// drop-in mechanism.
+const TIMESYNCD_PATH: &str = "/etc/systemd/timesyncd.conf.d/10-yip.conf";
 
 pub fn build() -> Plugin {
     Arc::new(run)
 }
 
-/// Write `[Time]` config from `stage.timesyncd` to `/etc/systemd/timesyncd.conf`.
+/// Write `[Time]` config from `stage.timesyncd` to the timesyncd drop-in
+/// file. Creates the parent directory if it doesn't already exist.
 pub fn run(stage: &Stage, fs: &dyn Vfs, _console: &dyn Console) -> Result<()> {
     if stage.timesyncd.is_empty() {
         return Ok(());
@@ -53,8 +61,17 @@ pub fn run(stage: &Stage, fs: &dyn Vfs, _console: &dyn Console) -> Result<()> {
         out.push('\n');
     }
 
-    debug!(path = TIMESYNCD_CONF, bytes = out.len(), "writing timesyncd config");
-    fs.write(Path::new(TIMESYNCD_CONF), out.as_bytes())?;
+    // Make sure the .conf.d/ directory exists before writing.
+    let target = Path::new(TIMESYNCD_PATH);
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            debug!(parent = %parent.display(), "ensuring timesyncd drop-in dir");
+            fs.mkdir_all(parent)?;
+        }
+    }
+
+    debug!(path = TIMESYNCD_PATH, bytes = out.len(), "writing timesyncd config");
+    fs.write(target, out.as_bytes())?;
     Ok(())
 }
 
@@ -78,7 +95,7 @@ mod tests {
         let console = RecordingConsole::new();
         run(&stage, &fs, &console).expect("ok");
 
-        let content = fs.read_to_string(Path::new(TIMESYNCD_CONF)).unwrap();
+        let content = fs.read_to_string(Path::new(TIMESYNCD_PATH)).unwrap();
         // Alphabetical: FallbackNTP < NTP (uppercase < lowercase in ASCII, both
         // upper here so simple lexicographic order applies).
         assert_eq!(
@@ -93,15 +110,17 @@ mod tests {
         let fs = MemVfs::new();
         let console = RecordingConsole::new();
         run(&stage, &fs, &console).expect("ok");
-        assert!(!fs.exists(Path::new(TIMESYNCD_CONF)));
+        assert!(!fs.exists(Path::new(TIMESYNCD_PATH)));
     }
 
     #[test]
     fn existing_file_is_overwritten() {
         let fs = MemVfs::new();
-        // Seed a pre-existing file with unrelated content.
+        // Seed a pre-existing file with unrelated content at the drop-in path.
+        fs.mkdir_all(Path::new("/etc/systemd/timesyncd.conf.d"))
+            .unwrap();
         fs.write(
-            Path::new(TIMESYNCD_CONF),
+            Path::new(TIMESYNCD_PATH),
             b"[Time]\nNTP=old.example.com\nLeftover=keep_me\n",
         )
         .unwrap();
@@ -115,7 +134,7 @@ mod tests {
         let console = RecordingConsole::new();
         run(&stage, &fs, &console).expect("ok");
 
-        let content = fs.read_to_string(Path::new(TIMESYNCD_CONF)).unwrap();
+        let content = fs.read_to_string(Path::new(TIMESYNCD_PATH)).unwrap();
         // Old `Leftover` key is gone — file was overwritten, not merged.
         assert_eq!(content, "[Time]\nNTP=new.example.com\n");
         assert!(!content.contains("Leftover"));
@@ -133,7 +152,7 @@ mod tests {
         let fs = MemVfs::new();
         let console = RecordingConsole::new();
         run(&stage, &fs, &console).expect("ok");
-        let content = fs.read_to_string(Path::new(TIMESYNCD_CONF)).unwrap();
+        let content = fs.read_to_string(Path::new(TIMESYNCD_PATH)).unwrap();
         let header_count = content.matches("[Time]").count();
         assert_eq!(header_count, 1);
         // 1 header line + 2 key=value lines + trailing newline.
@@ -159,7 +178,7 @@ mod tests {
         let fs = MemVfs::new();
         let console = RecordingConsole::default();
         run(&stage, &fs, &console).expect("ok");
-        let content = fs.read_to_string(Path::new(TIMESYNCD_CONF)).unwrap();
+        let content = fs.read_to_string(Path::new(TIMESYNCD_PATH)).unwrap();
         // 1 header + 5 keys + trailing newline -> 6 lines.
         assert_eq!(content.lines().count(), 6);
         // Alphabetical key order.
@@ -178,13 +197,14 @@ mod tests {
         let console = RecordingConsole::default();
         // Pre-create the parent dir to make sure absence of file is purely
         // due to empty map, not an mkdir failure.
-        fs.mkdir_all(Path::new("/etc/systemd")).unwrap();
+        fs.mkdir_all(Path::new("/etc/systemd/timesyncd.conf.d"))
+            .unwrap();
         let stage = Stage {
             timesyncd: HashMap::new(),
             ..Default::default()
         };
         run(&stage, &fs, &console).expect("ok");
-        assert!(!fs.exists(Path::new(TIMESYNCD_CONF)));
+        assert!(!fs.exists(Path::new(TIMESYNCD_PATH)));
     }
 
     #[test]
@@ -201,7 +221,48 @@ mod tests {
         let fs = MemVfs::new();
         let console = RecordingConsole::default();
         run(&stage, &fs, &console).expect("ok");
-        let content = fs.read_to_string(Path::new(TIMESYNCD_CONF)).unwrap();
+        let content = fs.read_to_string(Path::new(TIMESYNCD_PATH)).unwrap();
         assert_eq!(content, "[Time]\nNTP=0.pool\n");
+    }
+
+    // -------------------------------------------------------------------
+    // New tests asserting the drop-in path / mkdir_all behaviour.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn writes_to_conf_d_drop_in_path_not_top_level_conf() {
+        // Regression guard: the top-level /etc/systemd/timesyncd.conf must
+        // be left alone. Only the .conf.d/10-yip.conf drop-in should land.
+        let mut m = HashMap::new();
+        m.insert("NTP".into(), "x.example".into());
+        let stage = Stage {
+            timesyncd: m,
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        run(&stage, &fs, &console).expect("ok");
+        assert!(fs.exists(Path::new(
+            "/etc/systemd/timesyncd.conf.d/10-yip.conf"
+        )));
+        assert!(!fs.exists(Path::new("/etc/systemd/timesyncd.conf")));
+    }
+
+    #[test]
+    fn parent_conf_d_dir_is_created_when_missing() {
+        // The plugin must mkdir_all the .conf.d/ parent — even on a host
+        // that doesn't already have it. MemVfs starts empty.
+        let mut m = HashMap::new();
+        m.insert("NTP".into(), "a".into());
+        let stage = Stage {
+            timesyncd: m,
+            ..Default::default()
+        };
+        let fs = MemVfs::new();
+        let console = RecordingConsole::default();
+        assert!(!fs.exists(Path::new("/etc/systemd/timesyncd.conf.d")));
+        run(&stage, &fs, &console).expect("ok");
+        assert!(fs.exists(Path::new("/etc/systemd/timesyncd.conf.d")));
+        assert!(fs.exists(Path::new(TIMESYNCD_PATH)));
     }
 }

@@ -38,6 +38,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use nix::fcntl::{Flock, FlockArg};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
@@ -66,7 +67,9 @@ pub fn run(stage: &Stage, fs: &dyn Vfs, _console: &dyn Console) -> Result<()> {
 
     let mut errs: Vec<Error> = Vec::new();
     for e in &stage.ensure_entities {
-        if let Err(err) = ensure_one(fs, e) {
+        let target = ParsedEntity::target_for_yip_entity(e);
+        let res = with_passwd_lock(target.as_deref(), || ensure_one(fs, e));
+        if let Err(err) = res {
             warn!(path = %e.path, error = %err, "ensure entity failed");
             errs.push(err);
         }
@@ -91,7 +94,9 @@ pub fn run_delete(stage: &Stage, fs: &dyn Vfs, _console: &dyn Console) -> Result
 
     let mut errs: Vec<Error> = Vec::new();
     for e in &stage.delete_entities {
-        if let Err(err) = delete_one(fs, e) {
+        let target = ParsedEntity::target_for_yip_entity(e);
+        let res = with_passwd_lock(target.as_deref(), || delete_one(fs, e));
+        if let Err(err) = res {
             warn!(path = %e.path, error = %err, "delete entity failed");
             errs.push(err);
         }
@@ -100,6 +105,91 @@ pub fn run_delete(stage: &Stage, fs: &dyn Vfs, _console: &dyn Console) -> Result
         0 => Ok(()),
         _ => Err(Error::Multi(errs)),
     }
+}
+
+// ---------------------------------------------------------------------------
+// File locking
+// ---------------------------------------------------------------------------
+
+/// Serialise concurrent edits to `/etc/passwd`-style files via an advisory
+/// `flock` on a sibling `.yip-lock` file. Prevents corruption when immucore
+/// and a manual `useradd` (or two parallel yip executors) race to mutate the
+/// same passwd/shadow file.
+///
+/// The lock file is created on the host filesystem regardless of the Vfs in
+/// play. This is intentional: we want the lock to be visible to other
+/// processes on the real system. For unit tests using `MemVfs` the lock file
+/// lives in the real `/tmp`-style path the test picks (or fails to create —
+/// in which case we fall through to a warn-and-proceed path, matching Go
+/// yip's best-effort locking).
+///
+/// `target` is the resolved target path (e.g. `/etc/passwd`). When `None`
+/// (entity body could not be parsed), the lock step is skipped and the
+/// closure runs unguarded — `ensure_one` will then surface the parse error.
+fn with_passwd_lock<F>(target: Option<&Path>, f: F) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let Some(target) = target else {
+        return f();
+    };
+    let lock_path = lock_file_for(target);
+
+    let lock_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+    {
+        Ok(lf) => lf,
+        Err(e) => {
+            // Lock file unobtainable (e.g. /etc not writable, ro-fs, MemVfs
+            // test environment). Proceed unlocked — matches Go yip's
+            // best-effort posture. The mutating work itself will surface
+            // any real permission problems.
+            warn!(
+                lock = %lock_path.display(),
+                error = %e,
+                "entities: could not open lock file, proceeding without flock",
+            );
+            return f();
+        }
+    };
+
+    let flock = match Flock::lock(lock_file, FlockArg::LockExclusive) {
+        Ok(g) => Some(g),
+        Err((file, e)) => {
+            warn!(
+                lock = %lock_path.display(),
+                error = %e,
+                "entities: flock(LOCK_EX) failed, proceeding without lock",
+            );
+            // File handle preserved so the path still gets removed below.
+            drop(file);
+            None
+        }
+    };
+
+    let result = f();
+
+    // Drop the lock explicitly so a subsequent caller in the same process
+    // doesn't have to wait on the guard's Drop.
+    if let Some(g) = flock {
+        let _ = g.unlock();
+    }
+    // Best-effort cleanup; the lock file may legitimately still be held by
+    // another waiter, in which case remove() will fail silently.
+    let _ = std::fs::remove_file(&lock_path);
+    result
+}
+
+/// Sibling lock-file path for `target` (e.g. `/etc/passwd` →
+/// `/etc/passwd.yip-lock`).
+fn lock_file_for(target: &Path) -> PathBuf {
+    let mut s = target.as_os_str().to_owned();
+    s.push(".yip-lock");
+    PathBuf::from(s)
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +366,17 @@ struct GShadowEntity {
 }
 
 impl ParsedEntity {
+    /// Resolve the on-disk target path for `e` without surfacing parse
+    /// errors. Returns `None` if the entity YAML doesn't parse (the
+    /// downstream `from_yaml` call inside `ensure_one`/`delete_one` will
+    /// surface that error in turn — we just skip locking).
+    fn target_for_yip_entity(e: &YipEntity) -> Option<PathBuf> {
+        match Self::from_yaml(&e.entity) {
+            Ok(parsed) => Some(parsed.resolve_path(&e.path)),
+            Err(_) => None,
+        }
+    }
+
     fn from_yaml(body: &str) -> Result<Self> {
         let sig: Signature = serde_yaml::from_str(body).map_err(Error::from)?;
         match sig.kind.as_str() {
@@ -893,6 +994,52 @@ mod tests {
         let out = read(&fs, "/etc/shadow");
         assert_eq!(out, "root:!:19000:0:99999:7:::\n");
         assert!(!out.contains("alice"));
+    }
+
+    // -------------------------------------------------------------------
+    // Lock-wrapping smoke test.
+    //
+    // The lock wrap (with_passwd_lock) opens an advisory flock on a sibling
+    // .yip-lock file before invoking ensure_one. On a MemVfs the target
+    // path lives in memory only, so the sibling lock file ends up touching
+    // the real host filesystem (or failing, which is a non-fatal warn-and-
+    // proceed path). Either way, ensure_one must still produce the right
+    // result. This test pins that guarantee.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn ensure_works_through_lock_wrap() {
+        let fs = MemVfs::new();
+        let con = RecordingConsole::new();
+        write(&fs, "/etc/passwd", "root:x:0:0:root:/root:/bin/bash\n");
+
+        let stage = Stage {
+            ensure_entities: vec![YipEntity {
+                path: "/etc/passwd".into(),
+                entity: indoc! {r#"
+                    kind: user
+                    username: bob
+                    password: x
+                    uid: 1001
+                    gid: 1001
+                    info: Bob
+                    homedir: /home/bob
+                    shell: /bin/bash
+                "#}
+                .into(),
+            }],
+            ..Default::default()
+        };
+
+        // Goes through run() → with_passwd_lock() → ensure_one().
+        run(&stage, &fs, &con).unwrap();
+        let out = read(&fs, "/etc/passwd");
+        assert!(
+            out.contains("bob:x:1001:1001:Bob:/home/bob:/bin/bash"),
+            "ensure_one did not produce expected line; got: {out}",
+        );
+        // And the original line is preserved.
+        assert!(out.starts_with("root:x:0:0:root:/root:/bin/bash\n"));
     }
 
     #[test]

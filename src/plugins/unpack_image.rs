@@ -1114,64 +1114,6 @@ mod tests_skopeo {
 // Tests — online smoke tests (per backend, gated #[ignore]).
 // =====================================================================
 
-/// Online smoke test for the native OCI backend. Pulls a small image and
-/// asserts that at least one file landed in the target dir.
-#[cfg(all(test, feature = "oci-builtin", not(feature = "nounpack")))]
-mod tests_online_oci {
-    use super::*;
-
-}
-
-// =====================================================================
-// Direct ports of the Go `It` blocks in pkg/plugins/unpack_image_test.go.
-//
-// Go runs against `quay.io/luet/base:latest` and asserts that
-// `/tmp/unpack/usr/bin/luet` exists. The second It also checks that the
-// extracted binary is ARM/ARM64 via debug/elf parsing.
-//
-// Both tests require root + network in Go. We mark them `#[ignore]` and
-// only compile when the native OCI backend is on.
-// =====================================================================
-#[cfg(all(test, feature = "oci-builtin", not(feature = "nounpack")))]
-mod tests_go_unpack_image_port {
-    use super::*;
-    use crate::console::RecordingConsole;
-    use crate::vfs::TempVfs;
-
-    /// Parse the ELF header's `e_machine` field. Matches Go's
-    /// `debug/elf.File.Machine` check used in `isARMBinary`.
-    /// Returns Some((is_arm,)) on a valid ELF header.
-    fn is_arm_binary(path: &Path) -> std::io::Result<bool> {
-        let bytes = std::fs::read(path)?;
-        // ELF magic 0x7f 'E' 'L' 'F'
-        if bytes.len() < 0x14 || &bytes[0..4] != b"\x7fELF" {
-            return Ok(false);
-        }
-        // Bytes [0x05] = endianness (1 = little). e_machine at offset 0x12 (2 bytes).
-        let little = bytes[5] == 1;
-        let lo = bytes[0x12];
-        let hi = bytes[0x13];
-        let mach = if little {
-            u16::from_le_bytes([lo, hi])
-        } else {
-            u16::from_be_bytes([lo, hi])
-        };
-        const EM_ARM: u16 = 40;
-        const EM_AARCH64: u16 = 183;
-        Ok(mach == EM_ARM || mach == EM_AARCH64)
-    }
-
-}
-
-/// Online smoke test for the skopeo backend. Requires `skopeo` on $PATH.
-/// Only meaningful when the skopeo backend is the active one AND the
-/// `nounpack` kill-switch is off (otherwise `run()` short-circuits).
-#[cfg(all(test, not(feature = "oci-builtin"), not(feature = "nounpack")))]
-mod tests_online_skopeo {
-    use super::*;
-
-}
-
 // =====================================================================
 // Tests — nounpack disabled-feature behaviour.
 // =====================================================================

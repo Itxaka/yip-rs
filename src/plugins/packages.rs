@@ -41,10 +41,15 @@ pub(crate) enum PackageManager {
 }
 
 impl PackageManager {
+    /// Refresh / sync the package index. Matches Go's flags so configs
+    /// behave identically across the two impls.
     fn refresh_cmd(self) -> &'static str {
         match self {
             PackageManager::Apt => "apt-get update",
-            PackageManager::Dnf => "dnf check-update",
+            // Go uses `dnf makecache` (not `check-update`, which returns
+            // exit code 100 when updates are available and confuses the
+            // multierror chain).
+            PackageManager::Dnf => "dnf makecache",
             PackageManager::Apk => "apk update",
             PackageManager::Zypper => "zypper refresh",
         }
@@ -54,17 +59,27 @@ impl PackageManager {
         match self {
             PackageManager::Apt => "apt-get -y upgrade",
             PackageManager::Dnf => "dnf -y upgrade",
-            PackageManager::Apk => "apk upgrade",
+            // apk's `--no-cache` flag avoids leaving cache artefacts on
+            // the system after the upgrade — matches Go.
+            PackageManager::Apk => "apk upgrade --no-cache",
             PackageManager::Zypper => "zypper -n update",
         }
     }
 
     fn install_prefix(self) -> &'static str {
         match self {
-            PackageManager::Apt => "apt-get -y install",
+            // `--no-install-recommends` matches Go and is the kairos
+            // default: avoids dragging in suggested-but-not-required
+            // packages on Debian-family images.
+            PackageManager::Apt => "apt-get -y --no-install-recommends install",
             PackageManager::Dnf => "dnf -y install",
-            PackageManager::Apk => "apk add",
-            PackageManager::Zypper => "zypper -n install",
+            // `--no-cache` avoids the apk cache, same reasoning as
+            // `apk upgrade --no-cache`.
+            PackageManager::Apk => "apk add --no-cache",
+            // `-y` here is the per-action confirmation; `-n` on
+            // `zypper` itself is the non-interactive global flag. Go
+            // sets both.
+            PackageManager::Zypper => "zypper -n install -y",
         }
     }
 
@@ -73,7 +88,7 @@ impl PackageManager {
             PackageManager::Apt => "apt-get -y remove",
             PackageManager::Dnf => "dnf -y remove",
             PackageManager::Apk => "apk del",
-            PackageManager::Zypper => "zypper -n remove",
+            PackageManager::Zypper => "zypper -n remove -y",
         }
     }
 }
@@ -373,7 +388,10 @@ mod tests {
         write_os_release(&fs, "ID=ubuntu\n");
         let console = RecordingConsole::new();
         run(&stage_install(&["foo"]), &fs, &console).expect("ok");
-        assert_eq!(console.commands(), vec!["apt-get -y install foo".to_string()]);
+        assert_eq!(
+            console.commands(),
+            vec!["apt-get -y --no-install-recommends install foo".to_string()]
+        );
     }
 
     #[test]
@@ -385,6 +403,77 @@ mod tests {
         assert_eq!(
             console.commands(),
             vec!["dnf -y install foo bar".to_string()]
+        );
+    }
+
+    #[test]
+    fn dnf_refresh_uses_makecache() {
+        // Regression guard: dnf refresh must be `dnf makecache` (not the
+        // older `dnf check-update`), so the multierror chain doesn't see
+        // dnf's "updates available" exit code 100 as a failure.
+        let fs = MemVfs::new();
+        write_os_release(&fs, "ID=fedora\n");
+        let console = RecordingConsole::new();
+        let stage = Stage {
+            packages: Packages {
+                refresh: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        run(&stage, &fs, &console).expect("ok");
+        assert_eq!(console.commands(), vec!["dnf makecache".to_string()]);
+    }
+
+    #[test]
+    fn apt_install_uses_no_install_recommends() {
+        // The apt install prefix must include `--no-install-recommends`
+        // so kairos images don't pick up suggested packages.
+        let fs = MemVfs::new();
+        write_os_release(&fs, "ID=ubuntu\n");
+        let console = RecordingConsole::new();
+        run(&stage_install(&["foo", "bar"]), &fs, &console).expect("ok");
+        assert_eq!(
+            console.commands(),
+            vec!["apt-get -y --no-install-recommends install foo bar".to_string()]
+        );
+    }
+
+    #[test]
+    fn apk_install_uses_no_cache_flag() {
+        // `apk add --no-cache` matches Go and keeps the apk cache clean.
+        let fs = MemVfs::new();
+        write_os_release(&fs, "ID=alpine\n");
+        let console = RecordingConsole::new();
+        run(&stage_install(&["foo"]), &fs, &console).expect("ok");
+        assert_eq!(
+            console.commands(),
+            vec!["apk add --no-cache foo".to_string()]
+        );
+    }
+
+    #[test]
+    fn zypper_install_remove_use_y_flag() {
+        // Zypper non-interactive install/remove both require `-y`
+        // (per-action confirmation) on top of the global `-n`.
+        let fs = MemVfs::new();
+        write_os_release(&fs, "ID=opensuse-leap\n");
+        let console = RecordingConsole::new();
+        let stage = Stage {
+            packages: Packages {
+                install: vec!["a".into()],
+                remove: vec!["b".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        run(&stage, &fs, &console).expect("ok");
+        assert_eq!(
+            console.commands(),
+            vec![
+                "zypper -n install -y a".to_string(),
+                "zypper -n remove -y b".to_string(),
+            ]
         );
     }
 
@@ -408,7 +497,7 @@ mod tests {
             vec![
                 "apt-get update".to_string(),
                 "apt-get -y upgrade".to_string(),
-                "apt-get -y install foo bar".to_string(),
+                "apt-get -y --no-install-recommends install foo bar".to_string(),
                 "apt-get -y remove baz".to_string(),
             ]
         );
@@ -433,8 +522,8 @@ mod tests {
             console.commands(),
             vec![
                 "apk update".to_string(),
-                "apk upgrade".to_string(),
-                "apk add foo".to_string(),
+                "apk upgrade --no-cache".to_string(),
+                "apk add --no-cache foo".to_string(),
                 "apk del bar".to_string(),
             ]
         );
@@ -460,8 +549,8 @@ mod tests {
             vec![
                 "zypper refresh".to_string(),
                 "zypper -n update".to_string(),
-                "zypper -n install foo".to_string(),
-                "zypper -n remove bar".to_string(),
+                "zypper -n install -y foo".to_string(),
+                "zypper -n remove -y bar".to_string(),
             ]
         );
     }
@@ -484,7 +573,10 @@ mod tests {
         let fs = MemVfs::new();
         write_os_release(&fs, "ID=ubuntu\n");
         let console = RecordingConsole::new();
-        console.expect("apt-get -y install foo", Err("locked".to_string()));
+        console.expect(
+            "apt-get -y --no-install-recommends install foo",
+            Err("locked".to_string()),
+        );
         let stage = Stage {
             packages: Packages {
                 install: vec!["foo".into()],
@@ -512,7 +604,10 @@ mod tests {
         let console = RecordingConsole::new();
         let plugin = build();
         plugin(&stage_install(&["foo"]), &fs, &console).unwrap();
-        assert_eq!(console.commands(), vec!["apt-get -y install foo".to_string()]);
+        assert_eq!(
+            console.commands(),
+            vec!["apt-get -y --no-install-recommends install foo".to_string()]
+        );
     }
 
     // --- Additional tests ported from Go behaviour expectations ---
@@ -536,7 +631,7 @@ mod tests {
             console.commands(),
             vec![
                 "apt-get update".to_string(),
-                "apt-get -y install vim".to_string(),
+                "apt-get -y --no-install-recommends install vim".to_string(),
             ]
         );
     }
@@ -578,7 +673,7 @@ mod tests {
         run(&stage, &fs, &console).expect("ok");
         assert_eq!(
             console.commands(),
-            vec!["apk add foo=1.2.3 bar".to_string()]
+            vec!["apk add --no-cache foo=1.2.3 bar".to_string()]
         );
     }
 
@@ -624,7 +719,7 @@ mod tests {
             vec![
                 "apt-get update".to_string(),
                 "apt-get -y upgrade".to_string(),
-                "apt-get -y install vim".to_string(),
+                "apt-get -y --no-install-recommends install vim".to_string(),
                 "apt-get -y remove nano".to_string(),
             ]
         );
@@ -649,7 +744,7 @@ mod tests {
         assert_eq!(
             console.commands(),
             vec![
-                "dnf check-update".to_string(),
+                "dnf makecache".to_string(),
                 "dnf -y upgrade".to_string(),
                 "dnf -y install foo bar".to_string(),
                 "dnf -y remove baz".to_string(),
@@ -687,6 +782,6 @@ mod tests {
         assert!(console
             .commands()
             .iter()
-            .any(|c| c == "apt-get -y install foo"));
+            .any(|c| c == "apt-get -y --no-install-recommends install foo"));
     }
 }

@@ -75,6 +75,17 @@ mbrman = { version = "0.6", optional = true }
 # Password hashing for `users` plugin (yescrypt/sha512crypt as Linux uses)
 sha-crypt = "0.5"
 
+# Bcrypt for sprig `htpasswd` template func.
+bcrypt = "0.15"
+
+# Timezone database for sprig `dateInZone` template func.
+chrono-tz = "0.9"
+
+# Custom YAML resolver with merge-key (`<<: *anchor`) support — saphyr is a
+# drop-in lower-level YAML parser that exposes the AST and merge resolution.
+# Used by schema::config::load to preprocess YAML before serde_yaml parses it.
+saphyr = "0.0.6"
+
 [features]
 # Default brings every native backend in. Disable the relevant flag to shrink
 # the binary at the cost of needing the matching system binary (git / skopeo /
