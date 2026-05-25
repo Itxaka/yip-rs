@@ -346,6 +346,15 @@ impl DefaultExecutor {
             return Ok(vec![(source.to_string(), cfg)]);
         }
 
+        // Looks like a filesystem path but doesn't exist? Silently skip
+        // with a debug trace — matches Go yip's behaviour where missing
+        // cloud-init dirs (e.g. `/usr/local/cloud-config/` on a livecd
+        // before sysroot is populated) are no-ops, not errors.
+        if looks_like_fs_path(source) {
+            debug!(source, "resolve_source: filesystem path absent, skipping");
+            return Ok(Vec::new());
+        }
+
         // Inline YAML heuristic — matches Go's fallback (`schema.Load` with
         // nil source-type, which parses the string itself).
         if looks_like_inline_yaml(source) {
@@ -656,6 +665,17 @@ fn is_url(s: &str) -> bool {
 
 fn looks_like_inline_yaml(s: &str) -> bool {
     s.contains(':') && s.contains('\n')
+}
+
+/// True when `s` is shaped like a filesystem path (absolute, relative-with-`/`,
+/// or trailing slash) so missing-file callers can silent-skip instead of
+/// erroring as "not a file/dir/url/inline".
+fn looks_like_fs_path(s: &str) -> bool {
+    s.starts_with('/')
+        || s.starts_with("./")
+        || s.starts_with("../")
+        || s.ends_with('/')
+        || (s.contains('/') && !s.contains(':'))
 }
 
 fn fetch_url(url: &str) -> Result<Vec<u8>> {

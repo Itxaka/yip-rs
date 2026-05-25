@@ -29,12 +29,68 @@ pub fn dot_notation_modifier(input: &[u8]) -> Result<Vec<u8>> {
         if raw_key.is_empty() {
             continue;
         }
+        // Cmdline frequently contains tokens that AREN'T dot-notation —
+        // shell-test expressions like `[ -d /oem/userdata ]`, kernel
+        // params like `root=LABEL=COS_STATE`, etc. We can only safely
+        // treat a token as dot-notation if the key looks like one:
+        // - Starts with an identifier character (letter or `_`).
+        // - Every `[...]` block contains only digits.
+        // - Only ASCII identifier chars / dots / brackets in the key.
+        // Anything else is silently skipped (matches Go behaviour where
+        // non-conforming tokens are dropped instead of erroring out).
+        if !looks_like_dot_notation_key(&raw_key) {
+            continue;
+        }
         let path = parse_path(&raw_key)?;
         set_path(&mut root, &path, Value::String(raw_value));
     }
 
     let out = serde_yaml::to_string(&root)?;
     Ok(out.into_bytes())
+}
+
+/// Conservative guard so shell-test brackets, kernel-cmdline `root=LABEL=…`,
+/// and other non-dot-notation tokens get silently skipped rather than
+/// erroring the whole modifier pass. A key qualifies when:
+///
+/// - First character is an ASCII letter or `_` (so `[` / `/` / digit are out)
+/// - Every char is ASCII letter / digit / `_` / `.` / `[` / `]` / `-`
+/// - Every `[...]` block contains only ASCII digits
+fn looks_like_dot_notation_key(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let first = bytes[0];
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return false;
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'[' {
+            // Must contain only digits then a closing ']'.
+            let mut j = i + 1;
+            let mut any = false;
+            while j < bytes.len() && bytes[j] != b']' {
+                if !bytes[j].is_ascii_digit() {
+                    return false;
+                }
+                any = true;
+                j += 1;
+            }
+            if j >= bytes.len() || !any {
+                return false;
+            }
+            i = j + 1;
+            continue;
+        }
+        if !(b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-') {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 #[derive(Debug, PartialEq, Eq)]

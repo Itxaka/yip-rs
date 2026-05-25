@@ -522,7 +522,10 @@ fn directory_walk_picks_up_yaml_and_yml() {
 }
 
 #[test]
-fn nonexistent_path_is_rejected() {
+fn nonexistent_fs_path_is_silently_skipped() {
+    // Filesystem-shaped paths that don't exist are NOT errors — Go yip
+    // and yip-rs both treat them as "no configs to load" so livecd /
+    // pre-install boots don't fail on missing /usr/local/cloud-config/.
     let exec = DefaultExecutor::empty();
     let res = exec.run(
         "rootfs",
@@ -530,7 +533,22 @@ fn nonexistent_path_is_rejected() {
         &RecordingConsole::new(),
         &["/nonexistent/path/12345".to_string()],
     );
-    assert!(res.is_err());
+    assert!(res.is_ok(), "missing fs path should be silent no-op: {res:?}");
+}
+
+#[test]
+fn nonexistent_non_fs_token_is_rejected() {
+    // A token that doesn't look like a path / URL / inline YAML — like
+    // a stray word — still surfaces as an error so typos in CLI args
+    // don't silently succeed.
+    let exec = DefaultExecutor::empty();
+    let res = exec.run(
+        "rootfs",
+        &RealVfs::new(),
+        &RecordingConsole::new(),
+        &["definitely-not-a-thing".to_string()],
+    );
+    assert!(res.is_err(), "non-path bogus token should error");
 }
 
 // ---------------------------------------------------------------------------
